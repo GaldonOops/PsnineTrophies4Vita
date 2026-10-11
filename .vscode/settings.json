@@ -1,0 +1,8 @@
+{
+  "clangd.arguments": [
+    "--query-driver=/usr/local/vitasdk/bin/arm-vita-eabi-gcc",
+    "--compile-commands-dir=${workspaceFolder}/vita/PsnineTrophies4Vita/build",
+    "--background-index"
+  ],
+  "cmake.sourceDirectory": "/workspaces/psnine4vita/vita/PsnineTrophies4Vita"
+}
