@@ -22,7 +22,7 @@
 ## 2. 快速安装
 
 1. 从 [Releases 页面](../../releases/latest) 下载最新版 `PsnineTrophies4Vita.vpk`。
-2. 在 PS Vita 上打开 **VitaShell**，按 **L1** 启动 FTP 服务，屏幕会显示地址，
+2. 在 PS Vita 上打开 **VitaShell**，按 **select** 启动 FTP 服务，屏幕会显示地址，
    如 `ftp://192.168.1.20:1337`。
 3. 在电脑上用任意 FTP 工具上传（curl 注意分区冒号要写成 `%3a`）：
 
