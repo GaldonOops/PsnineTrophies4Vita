@@ -6,6 +6,10 @@ A read-only PSN trophy browser for the hacked PlayStation Vita, with an UI
 modeled after the console's native trophy application. Trophy data is browsed live from
 [psnine.com](https://psnine.com), the PSN community site.
 
+| Trophy list (live psnine data) | Trophy tips list |
+|:---:|:---:|
+| ![Trophy list](docs/screenshots/trophy-list.png) | ![Tips list](docs/screenshots/tips-list.png) |
+
 ## 1. What it does
 
 - **Game search** — fuzzy title search over the psnine game database, with cover art,

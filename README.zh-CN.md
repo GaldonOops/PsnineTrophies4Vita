@@ -5,6 +5,10 @@
 一款运行在已破解 PlayStation Vita 上的**只读** PSN 奖杯浏览器，中文界面，视觉与交互
 对标系统原生奖杯 app。奖杯数据实时来自 PSN 中文站 [psnine.com](https://psnine.com)。
 
+| 奖杯列表（psnine 实时数据） | 奖杯 Tips 列表 |
+|:---:|:---:|
+| ![奖杯列表](docs/screenshots/trophy-list.png) | ![Tips 列表](docs/screenshots/tips-list.png) |
+
 ## 1. 功能
 
 - **游戏搜索** — 按标题模糊搜索 psnine 游戏库，列表带封面、平台标
