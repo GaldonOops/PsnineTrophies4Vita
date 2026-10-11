@@ -2,3 +2,4 @@ node_modules/
 build/
 .cache/
 scripts/fixtures/
+.DS_Store

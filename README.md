@@ -1,5 +1,7 @@
 # PsnineTrophies4Vita
 
+**English | [简体中文](README.zh-CN.md)**
+
 A read-only PSN trophy browser for the hacked PlayStation Vita, with an UI
 modeled after the console's native trophy application. Trophy data is browsed live from
 [psnine.com](https://psnine.com), the PSN community site.
