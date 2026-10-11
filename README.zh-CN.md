@@ -65,42 +65,11 @@ cmake --build build          # -> build/PsnineTrophies4Vita.vpk
   否则 VitaShell 安装会报 `0x8010113D`。
 - 产物传输与安装见第 2 节。
 
-## 4. 数据来源与巡检脚本
+## 4. 数据来源
 
 所有奖杯内容都由 psnine.com 以普通网页渲染。本项目**不是爬虫**：用户每打开一个页面，
 app 才发起一次匿名 HTTP GET——与人类访客的浏览器行为完全一致；不做批量 URL 遍历、
 没有后台抓取循环、不镜像站点内容（仅在机内缓存少量奖杯/封面图片用于显示）。
-
-由于站点是无公开 API 的服务端渲染 PHP 程序，解析器依赖其 DOM 结构。为在改版影响到
-用户之前发现问题，仓库内置一个**巡检脚本**：
-
-```sh
-npm install     # 首次，安装 cheerio
-npm run patrol  # scripts/scraper.mjs --patrol
-```
-
-每次运行会：
-
-- 抓取一小组固定探针页（一个搜索结果页、游戏 `57900`、奖杯 `57900001`，
-  外加由该游戏派生的两个 Tips 页）——总共十来个请求，适合偶尔运行（例如每周一天的
-  cron），绝非常驻抓取。
-- 断言的是语义结果而非原始 HTML：结果数 > 0、每行奖杯有可跳转 id、等级/名称字段
-  解析成功、每个 Tips 页至少命中两套并存模板（`div.post` 或 `ul.list > li`）之一。
-- 每条断言输出一行 `PASS`/`FAIL`，外加模板普查统计（`div.post=N ul.list=M`）反映
-  线上 Tips 页当前用哪套模板；任一断言失败即非零退出——站点改版首先表现为巡检变红，
-  而不是真机上静默白屏。
-- 把抓到的页面存到 `scripts/fixtures/`（已 gitignore）作为离线语料。
-
-交叉验证：`scripts/parse_probe.c` 可在编译容器里用 app 自己的 C 解析器
-（`src/parse.c` + gumbo）回放这些 fixture，确认机内解析器与巡检对同一份 DOM 的
-理解一致：
-
-```sh
-gcc -I vita/PsnineTrophies4Vita/src -I vita/PsnineTrophies4Vita/third_party/gumbo-parser/src \
-  scripts/parse_probe.c vita/PsnineTrophies4Vita/src/parse.c \
-  vita/PsnineTrophies4Vita/third_party/gumbo-parser/src/*.c -o /tmp/parse_probe
-/tmp/parse_probe game scripts/fixtures/trophies-57900.html
-```
 
 ---
 

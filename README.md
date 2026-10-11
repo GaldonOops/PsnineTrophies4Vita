@@ -76,47 +76,13 @@ Notes:
   otherwise VitaShell rejects the install with `0x8010113D`.
 - Transfer the resulting VPK to the console as described in section 2.
 
-## 4. Data source & patrol script
+## 4. Data source
 
 All trophy content is rendered by psnine.com as ordinary web pages. This app is **not a
 crawler**: it issues exactly one anonymous HTTP GET per screen the user opens — the same
 requests a human visitor's browser would make — with no bulk URL enumeration, no
 background scraping loops and no mirroring of site content (only small trophy/cover
 images are cached on the console for display).
-
-Because the site is a server-rendered PHP app without a public API, the parsers depend
-on its DOM structure. To detect site redesigns before they hit users, the repo includes
-a **patrol script**:
-
-```sh
-npm install     # once, for cheerio
-npm run patrol  # scripts/scraper.mjs --patrol
-```
-
-What it does on each run:
-
-- Fetches a small fixed set of probe pages (a search result page, game `57900`, trophy
-  `57900001`, plus two tips pages derived from that game) — a handful of requests, meant
-  to be run occasionally (e.g. a weekly cron job), never continuously.
-- Asserts semantic expectations instead of raw HTML: result counts > 0, every trophy row
-  carries a linkable id, rank/name fields parse, and each tips page matches at least one
-  of the two coexisting tips templates (`div.post` or `ul.list > li`).
-- Prints one `PASS`/`FAIL` line per assertion plus a template census
-  (`div.post=N ul.list=M`) showing which tips template is currently live, and exits
-  non-zero if any assertion fails — so a site redesign turns into a red patrol run
-  instead of silently broken pages on the console.
-- Saves the fetched pages under `scripts/fixtures/` (gitignored) as an offline corpus.
-
-For cross-validation, `scripts/parse_probe.c` replays those fixtures through the app's
-own C parser (`src/parse.c` + gumbo) in the build container, confirming the on-device
-parser and the patrol agree on the same DOM:
-
-```sh
-gcc -I vita/PsnineTrophies4Vita/src -I vita/PsnineTrophies4Vita/third_party/gumbo-parser/src \
-  scripts/parse_probe.c vita/PsnineTrophies4Vita/src/parse.c \
-  vita/PsnineTrophies4Vita/third_party/gumbo-parser/src/*.c -o /tmp/parse_probe
-/tmp/parse_probe game scripts/fixtures/trophies-57900.html
-```
 
 ---
 
