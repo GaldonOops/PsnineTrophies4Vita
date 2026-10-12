@@ -16,12 +16,12 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 set(VITA_APP_NAME "PsnineTrophies4Vita")
 set(VITA_TITLEID "PSNIN0003")
-set(VITA_VERSION "00.90")
+set(VITA_VERSION "01.00")
 set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d PARENTAL_LEVEL=1")
 
 # -O3 must be given explicitly: the vitasdk toolchain only adds optimization when
-# CMAKE_BUILD_TYPE=Release; left empty GCC defaults to -O0 and per-pixel compositing
-# measured 385ms/frame on real hardware
+# CMAKE_BUILD_TYPE=Release; left empty GCC defaults to -O0. Rendering is on the GPU now,
+# but icon decode (jpeg/png) still runs on the CPU in the data threads.
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -O3 -DNDEBUG")
 
 set(GUMBO_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/gumbo-parser)
@@ -30,7 +30,7 @@ set_source_files_properties(${GUMBO_SOURCES} PROPERTIES COMPILE_OPTIONS "-w")
 
 add_executable(${PROJECT_NAME}
   src/main.c
-  src/render.c
+  src/gpu.c
   src/data.c
   src/parse.c
   src/net.c
@@ -40,7 +40,9 @@ target_include_directories(${PROJECT_NAME} PRIVATE
   ${VITASDK}/arm-vita-eabi/include/freetype2
   ${GUMBO_DIR}/src
 )
+# vita2d comes first: it pulls in freetype/png and the GXM/display sysmodules it calls
 target_link_libraries(${PROJECT_NAME}
+  vita2d
   freetype png jpeg bz2 z m
   SceCtrl_stub
   SceDisplay_stub

@@ -9,7 +9,7 @@
 // Plain HTTP returns 200 on both CDNs, so for now https is rewritten to http (TLS: see task #9).
 #include "data.h"
 #include "net.h"
-#include "render.h"
+#include "gpu.h"
 
 #include <psp2/kernel/threadmgr.h>
 
@@ -628,25 +628,25 @@ int data_poll(void) {
 }
 
 int data_init(void) {
-	w_fbuf[0] = render_alloc(FETCH_CAP);
+	w_fbuf[0] = gpu_arena_alloc(FETCH_CAP);
 	if (!w_fbuf[0]) return -1;
 	for (int i = 0; i < W_N; i++) {
-		w_scratch[i] = render_alloc((size_t)SCRATCH_PX * 4);
+		w_scratch[i] = gpu_arena_alloc((size_t)SCRATCH_PX * 4);
 		if (!w_scratch[i]) return -1;
-		w_cmap[i] = render_alloc(256 * 4);
+		w_cmap[i] = gpu_arena_alloc(256 * 4);
 		if (!w_cmap[i]) return -1;
 		if (i > 0) {
-			w_fbuf[i] = render_alloc(ICON_CAP);
+			w_fbuf[i] = gpu_arena_alloc(ICON_CAP);
 			if (!w_fbuf[i]) return -1;
 		}
 	}
 	slot_px[IC_COVER] = COVER_W * COVER_H;
 	slot_px[IC_CUP] = CUP_W * CUP_H;
 	for (int k = 0; k < IC_KIND_N; k++) {
-		phic[k] = render_alloc0((size_t)slot_px[k] * 4);
+		phic[k] = gpu_arena_alloc0((size_t)slot_px[k] * 4);
 		if (!phic[k]) return -2;
 		for (int i = 0; i < W_N; i++) {
-			w_tmpic[i][k] = render_alloc((size_t)slot_px[k] * 4);
+			w_tmpic[i][k] = gpu_arena_alloc((size_t)slot_px[k] * 4);
 			if (!w_tmpic[i][k]) return -2;
 		}
 		int dw = k == IC_COVER ? COVER_W : CUP_W;
@@ -654,7 +654,7 @@ int data_init(void) {
 		for (int i = 0; i < slot_px[k]; i++) phic[k][i] = 0x90343438u; /* neutral gray placeholder, so it doesn't look like a black block */
 		round_alpha(phic[k], dw, dh, 8);
 		for (int i = 0; i < SLOT_N; i++) {
-			slots[k][i].px = render_alloc0((size_t)slot_px[k] * 4);
+			slots[k][i].px = gpu_arena_alloc0((size_t)slot_px[k] * 4);
 			slots[k][i].state = ST_FREE;
 			slots[k][i].w = (short)dw;
 			slots[k][i].h = (short)dh;
