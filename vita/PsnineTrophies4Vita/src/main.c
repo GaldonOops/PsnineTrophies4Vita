@@ -1018,7 +1018,7 @@ static void open_ime(void) {
 
 /* Returns 1 = the dialog has ended (text captured or exited on failure) */
 static int pump_ime(void) {
-	SceCommonDialogStatus st = sceImeDialogGetStatus();
+	int st = (int)sceImeDialogGetStatus(); /* the enum's underlying type is unsigned: keep the error bit visible */
 	if (st < 0) { /* Don't get stuck in the IME branch when Init succeeded but the dialog isn't running */
 		dlog("ime status=%x", (unsigned)st);
 		sceImeDialogTerm();

@@ -124,12 +124,6 @@ void gpu_draw_a(int x, int y, const vita2d_texture *t, int k) {
 	vita2d_draw_texture_tint(t, (float)x, (float)y, RGBA8(255, 255, 255, k));
 }
 
-/* darken a texture without touching its alpha: gray k, opaque alpha */
-void gpu_draw_shade(int x, int y, const vita2d_texture *t, int k) {
-	if (!t) return;
-	vita2d_draw_texture_tint(t, (float)x, (float)y, RGBA8(k, k, k, 255));
-}
-
 void gpu_draw_part(int x, int y, const vita2d_texture *t, int tx, int ty, int tw, int th) {
 	if (!t || tw <= 0 || th <= 0) return;
 	vita2d_draw_texture_part(t, (float)x, (float)y, (float)tx, (float)ty, (float)tw, (float)th);

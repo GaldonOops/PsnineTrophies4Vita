@@ -10,7 +10,7 @@
      an alpha of 0 means fully transparent, so opaque colors must carry 0xff.
    - vita2d blends with (SRC_ALPHA, ONE_MINUS_SRC_ALPHA), i.e. plain *straight* alpha, exactly
      like the old CPU canvas: no premultiplication anywhere. The tint color modulates all four
-     channels, so dimming alpha and dimming rgb need different helpers (see gpu_draw_a/_shade). */
+     channels, so fading alpha and squashing rgb need different helpers (see gpu_draw_a). */
 
 #include <stddef.h>
 #include <stdint.h>
@@ -18,7 +18,7 @@
 
 #define GPU_W 960
 #define GPU_H 544
-#define GPU_BG 0xff201820u /* GPU_BG == old RENDER_BG, with an opaque alpha byte */
+#define GPU_BG 0xff201820u /* the v0.9 backdrop color, with an opaque alpha byte */
 
 /* arena + vita2d + font; <0 on failure */
 int  gpu_init(void);
@@ -49,8 +49,6 @@ vita2d_texture *gpu_icon(int kind, const char *url, int *w, int *h);
 void gpu_draw(int x, int y, const vita2d_texture *t);
 /* alpha scaled to k/255 (touch flash, breathing selection mask, bubble focus) */
 void gpu_draw_a(int x, int y, const vita2d_texture *t, int k);
-/* rgb scaled by k/255, alpha untouched (page turn darkening) */
-void gpu_draw_shade(int x, int y, const vita2d_texture *t, int k);
 void gpu_draw_part(int x, int y, const vita2d_texture *t, int tx, int ty, int tw, int th);
 /* sub-rect with alpha scaled to k/255: masks that have to be clamped to a band */
 void gpu_draw_part_a(int x, int y, const vita2d_texture *t, int tx, int ty, int tw, int th, int k);
