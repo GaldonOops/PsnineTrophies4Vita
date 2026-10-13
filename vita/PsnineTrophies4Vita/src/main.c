@@ -697,9 +697,17 @@ static void draw_icon_at(int x, int y, int kind, const char *url, int show_ph) {
 	/* Every icon slot sits at x>=ICON_X, so a smaller x is a bug worth a log line: one appeared
 	   over the search box in a device screenshot and no call site can account for it. */
 	if (x < 60) dlog("icon@%d,%d %dx%d k=%d %.48s", x, y, w, h, kind, url);
+	int st = data_icon_state(kind, url);
+	if (st == DI_READY) {
+		gpu_draw(x, y, t);
+		return;
+	}
 	/* Trophy balls only ever show PSN's art: no gray placeholder box */
-	if (!show_ph && data_icon_state(kind, url) != DI_READY) return;
-	gpu_draw(x, y, t);
+	if (show_ph) gpu_draw(x, y, t);
+	/* Still in flight: spin the same loader in the middle of the slot, so an empty icon reads as
+	   "downloading" rather than "this game has no art". A failure keeps the static placeholder. */
+	if (st != DI_FAIL && spin_shown >= 0 && w >= SPN_S && h >= SPN_S)
+		gpu_draw(x + (w - SPN_S) / 2, y + (h - SPN_S) / 2, T_spin[spin_shown]);
 }
 
 static void row_icon(int scr, int item, int y) {
