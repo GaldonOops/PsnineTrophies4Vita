@@ -64,7 +64,4 @@ extern int dt_tip_n;
 extern long dt_head_id;   /* currently loaded game */
 extern long dt_tips_for;  /* trophy whose tips are loaded */
 
-/* version counters for row-texture caches: bumped on data generation change, auto-invalidating stale cached rows */
-extern int dt_gen[3]; /* 0=list 1=game(groups+trophies) 2=tips */
-
 #endif

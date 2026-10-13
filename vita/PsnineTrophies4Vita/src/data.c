@@ -99,7 +99,6 @@ int dt_trophy_n;
 PsTip dt_tip[PS_TIPS];
 int dt_tip_n;
 long dt_head_id, dt_tips_for;
-int dt_gen[3];
 
 static int live_err;
 
@@ -606,7 +605,6 @@ int data_poll(void) {
 		dt_list_mode = searching;
 		/* less than a full page means the site is exhausted; also stop at the 256-entry cap */
 		dt_list_more = !searching && n >= PS_GAMES && dt_list_n < DT_LIST_MAX;
-		dt_gen[0]++;
 		ch |= DC_LIST;
 	} else if (kind == J_GAME) {
 		dt_head = st_head;
@@ -615,13 +613,11 @@ int data_poll(void) {
 		dt_group_n = ng;
 		dt_trophy_n = n;
 		dt_head_id = id;
-		dt_gen[1]++;
 		ch |= DC_GAME;
 	} else {
 		memcpy(dt_tip, st_tip, sizeof(dt_tip));
 		dt_tip_n = n > PS_TIPS ? PS_TIPS : n;
 		dt_tips_for = id;
-		dt_gen[2]++;
 		ch |= DC_TIPS;
 	}
 	return ch | ic;
