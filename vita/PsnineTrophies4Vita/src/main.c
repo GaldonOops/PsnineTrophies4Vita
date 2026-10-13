@@ -148,6 +148,13 @@ static int top_of(int scr) { return topv[scr]; }
 static int *cur_pp(int scr) { return &curv[scr]; }
 static int *top_pp(int scr) { return &topv[scr]; }
 
+/* Is the level-1 list showing its last row? Either the cursor sits on it (d-pad) or the finger has dragged
+   the viewport to the end -- touch deliberately leaves the cursor alone, so watching only the cursor made
+   paging work with buttons and never with a scroll. */
+static int list_at_end(void) {
+	return curv[SCR_GAMES] + 1 >= dt_list_n || top_of(SCR_GAMES) + rows_vis(SCR_GAMES) >= dt_list_n;
+}
+
 static int cup_of(char t) { /* 'p' platinum, 'g' gold, 's' silver, otherwise bronze */
 	switch (t) {
 	case 'p': return 0;
@@ -1363,8 +1370,7 @@ int main(void) {
 			}
 
 			/* Level 1 pulled to the bottom: fetch the next page and append it (native list behaviour, no left/right paging) */
-			if (scr == SCR_GAMES && dt_list_more && !list_pending() && !peel_on &&
-			    curv[SCR_GAMES] + 1 >= dt_list_n) {
+			if (scr == SCR_GAMES && dt_list_more && !list_pending() && !peel_on && list_at_end()) {
 				list_want = dt_list_page + 1;
 				data_request_list(list_want);
 			}
