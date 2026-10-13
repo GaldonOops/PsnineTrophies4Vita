@@ -1,8 +1,8 @@
 // Native trophy-app-style UI: data comes from real psnine scraping (data.c background thread), assets extracted from vs0
 // All layout sizes measured pixel-by-pixel from native screenshots on real hardware (row height 90, list start 128, icon slot 154x84...)
-// Performance strategy: text baked into whole-row textures cached on demand, network icons composited separately once they arrive, runtime only does memcpy and NEON blending,
-//           selection mask eases at 60fps; scrolling and mask movement reach the screen within a few milliseconds
-#include "render.h"
+// Rendering: every vsync repaints the whole screen as GPU textured quads through gpu.c (libvita2d),
+//            so scrolling, the selection mask and the page turn all animate at a steady 60fps.
+#include "gpu.h"
 #include "data.h"
 
 #include <psp2/apputil.h>
@@ -25,11 +25,14 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <arm_neon.h>
+#define SCREEN_W GPU_W
+#define SCREEN_H GPU_H
 
-/* Colors are always 0xAABBGGRR (memory byte order R,G,B,A) */
-#define C(r, g, b)   ((uint32_t)(r) | ((uint32_t)(g) << 8) | ((uint32_t)(b) << 16))
-#define CA(r, g, b, a) (((uint32_t)(a) << 24) | C(r, g, b))
+/* Colors are always 0xAABBGGRR; on the GPU the alpha byte is a real blend weight, so C() is opaque
+   and translucency has to be asked for with CA(). */
+#define C(r, g, b)   (0xff000000u | ((uint32_t)(r)) | ((uint32_t)(g) << 8) | ((uint32_t)(b) << 16))
+#define CA(r, g, b, a) (((uint32_t)(a) << 24) | ((uint32_t)(r)) | ((uint32_t)(g) << 8) | ((uint32_t)(b) << 16))
+
 
 /* ---------------- Minimal logging for crash diagnosis (file only, not on screen) ---------------- */
 static int log_fd = -1;
@@ -84,8 +87,6 @@ static void diag_open(void) {
 #define SPN_Y   64             /* 32px spinner centered in 32..128: right of the legend bronze cup */
 #define SPN_S   32
 #define SEL_H   92             /* Selection mask texture height (1px taller than the row on top and bottom) */
-#define MAX_ROW 6
-#define MAX_CACHE 12           /* Row texture cache slots: only bake the few visible rows */
 
 /* ---------------- Screen state ----------------
    Five levels: games -> trophy groups -> trophies -> Tips -> single Tip body.
@@ -104,8 +105,6 @@ int peel_req;             /* Whether to page-turn this frame: +1 enter, -1 back;
 static long long retry_at; /* Resend timestamp after a request failure; avoids resending every frame */
 
 static int lt_of(int scr) { return scr == SCR_GAMES ? LT_TOP : LT_TOP + ROW_H; }
-/* Earliest start allowed for snapshot/mask: the mask sits 1px above the row top, and that row must be restorable too */
-static int snap0_of(int scr) { return lt_of(scr) - 1; }
 /* Fully visible rows: when the last row is half cut by the screen, selecting it must scroll (native does this) */
 static int rows_vis(int scr) { return (SCREEN_H - lt_of(scr)) / ROW_H; }
 /* Rows to draw: the partial trailing row is drawn too; the list is cut off by the screen's bottom edge.
@@ -144,14 +143,17 @@ static int cnt_of(int scr) {
 static int item_of(int scr, int idx) {
 	return scr == SCR_TROPHIES ? dt_group[cur_group()].t0 + idx : idx;
 }
-/* Version of the row-texture cache: when data changes generation, all baked rows are invalidated */
-static int gen_of(int scr) {
-	return scr == SCR_GAMES ? dt_gen[0] : scr == SCR_TIPS ? dt_gen[2] : dt_gen[1];
-}
 static int cur_of(int scr) { return curv[scr]; }
 static int top_of(int scr) { return topv[scr]; }
 static int *cur_pp(int scr) { return &curv[scr]; }
 static int *top_pp(int scr) { return &topv[scr]; }
+
+/* Is the level-1 list showing its last row? Either the cursor sits on it (d-pad) or the finger has dragged
+   the viewport to the end -- touch deliberately leaves the cursor alone, so watching only the cursor made
+   paging work with buttons and never with a scroll. */
+static int list_at_end(void) {
+	return curv[SCR_GAMES] + 1 >= dt_list_n || top_of(SCR_GAMES) + rows_vis(SCR_GAMES) >= dt_list_n;
+}
 
 static int cup_of(char t) { /* 'p' platinum, 'g' gold, 's' silver, otherwise bronze */
 	switch (t) {
@@ -168,37 +170,39 @@ static void reveal(int *c, int *t, int scr) {
 	if (*c >= *t + v) *t = *c - v + 1;
 	if (*t < 0) *t = 0;
 }
-/* ---------------- Texture primitives ---------------- */
+/* ---------------- Sprites ----------------
+   Native RCO art ships as raw .rgba and is uploaded once; the recolored and procedural pieces are
+   still baked on the CPU (s_px below writes straight-alpha pixels) and uploaded as textures.
+   Nothing is composited per pixel at runtime any more. */
 typedef struct { uint32_t *p; int w, h; } Spr;
 
-static uint32_t *bg; /* 960x544 native radial-ray background (pre-darkened as the base) */
-
-static Spr S_sel, S_rowbg, S_legend;          /* Native RCO assets */
-static Spr S_selw, S_bub_tl, S_bub_w;         /* Recolor-baked at startup: white row mask / teal bubble mask / white bubble mask */
-static Spr S_field;                           /* Top-left search box base */
-static Spr C_cup26[5];                         /* Native 26px trophy badges (large icons always come from PSN) */
-static Spr S_track, S_fill, S_box, S_play, S_dlc;
-static Spr S_back;   /* Bottom-left back bubble: system highlight orb recolored + livearea's ↩ glyphs */
+static vita2d_texture *T_bg;                    /* 960x544 native radial-ray background */
+static vita2d_texture *T_sel, *T_rowbg, *T_legend;   /* Native RCO assets */
+static vita2d_texture *T_selw, *T_bub_tl, *T_bub_w;  /* Recolored at startup: white row mask / teal + white bubble mask */
+static vita2d_texture *T_field;                 /* Top-left search box base */
+static vita2d_texture *T_cup26[5];               /* Native 26px trophy badges (large icons always come from PSN) */
+static vita2d_texture *T_track, *T_fill, *T_box, *T_dlc;
+static vita2d_texture *T_back;                  /* Bottom-left back bubble: system highlight orb recolored + livearea's ↩ glyphs */
+static vita2d_texture *T_spin[8];                /* Spinner frames, positioned like the loading animation on the native PSN page */
 
 static int spr_alloc(Spr *s, int w, int h) {
-	s->p = render_alloc0((size_t)w * h * 4);
+	s->p = gpu_arena_alloc0((size_t)w * h * 4);
 	s->w = s->p ? w : 0;
 	s->h = s->p ? h : 0;
 	return s->p ? 0 : -1;
 }
 
-/* Bake-canvas pixel: store directly if the target is transparent, otherwise alpha-over composite */
+/* Bake a CPU-drawn sprite into a GPU texture; the staging pixels stay in the pool. */
+static vita2d_texture *spr_tex(Spr *s) {
+	vita2d_texture *t = gpu_tex_upload(s->p, s->w, s->h);
+	if (!t) dlog("spr tex %dx%d fail", s->w, s->h);
+	return t;
+}
+
+/* Bake-canvas pixel: straight alpha, the GPU does the compositing */
 static void s_px(Spr *s, int x, int y, uint32_t c) {
 	if (x < 0 || x >= s->w || y < 0 || y >= s->h) return;
-	uint32_t *d = &s->p[(size_t)y * s->w + x];
-	unsigned as = (c >> 24) & 0xff, ad = (*d >> 24) & 0xff;
-	if (ad == 0 || as >= 255) { *d = c; return; }
-	unsigned na = as + (ad * (255 - as) >> 8);
-	if (na == 0) { *d = 0; return; }
-	unsigned r = (((c & 0xff) * as) + ((*d & 0xff) * ad * (255 - as) >> 8)) / na;
-	unsigned g = ((((c >> 8) & 0xff) * as) + (((*d >> 8) & 0xff) * ad * (255 - as) >> 8)) / na;
-	unsigned b = ((((c >> 16) & 0xff) * as) + (((*d >> 16) & 0xff) * ad * (255 - as) >> 8)) / na;
-	*d = (na << 24) | (b << 16) | (g << 8) | r;
+	s->p[(size_t)y * s->w + x] = c;
 }
 
 static int rr_inset(int t, int r) { /* Rounded-row inset: t = row number from the top (or bottom) edge */
@@ -234,260 +238,118 @@ static void s_rrect_border(Spr *s, int x, int y, int w, int h, int r, uint32_t c
 	}
 }
 
-/* Runtime blending: NEON, 8 pixels at a time. Measured on real hardware, scalar -O3 costs 37 instructions per pixel,
-   one 960x92 mask band takes 8ms, so easing animations must be vectorized.
-   Weights sum to a fixed 255: od*(255-a) + cd*a peaks at 65025, fitting exactly in uint16;
-   the earlier int16 form od + ((cd-od)*a >> 8) wrapped negative — that was the source of the screen-full of noise.
-   (t + (t>>8) + 128) >> 8 is fixed-point rounding of t/255; exact source color when a=255 */
-static void blend_row(uint32_t *dp, const uint32_t *sp, int n) {
-	int i = 0;
-	for (; i + 8 <= n; i += 8) {
-		uint8x8x4_t s = vld4_u8((const uint8_t *)(sp + i));
-		uint8x8x4_t o = vld4_u8((const uint8_t *)(dp + i));
-		uint8x8_t ia = vsub_u8(vdup_n_u8(255), s.val[3]);
-		uint8x8x4_t r;
-		for (int k = 0; k < 3; k++) {
-			uint16x8_t t = vaddq_u16(vmull_u8(o.val[k], ia), vmull_u8(s.val[k], s.val[3]));
-			t = vaddq_u16(t, vshrq_n_u16(t, 8));
-			t = vaddq_u16(t, vdupq_n_u16(128));
-			r.val[k] = vshrn_n_u16(t, 8);
-		}
-		r.val[3] = o.val[3];
-		vst4_u8((uint8_t *)(dp + i), r);
-	}
-	for (; i < n; i++) {
-		uint32_t c = sp[i], o = dp[i];
-		int a = (int)((c >> 24) & 0xff);
-		if (!a) continue;
-		uint32_t rr = (o & 0xff) + ((((int)(c & 0xff)) - (int)(o & 0xff)) * a >> 8);
-		uint32_t gg = ((o >> 8) & 0xff) + ((((int)((c >> 8) & 0xff)) - (int)((o >> 8) & 0xff)) * a >> 8);
-		uint32_t bb = ((o >> 16) & 0xff) + ((((int)((c >> 16) & 0xff)) - (int)((o >> 16) & 0xff)) * a >> 8);
-		dp[i] = (o & 0xff000000) | ((bb & 0xff) << 16) | ((gg & 0xff) << 8) | (rr & 0xff);
-	}
-}
+/* Repaint a full-width band of the background. Rows sliding up must not smear onto the chrome above
+   them, and repainting the band they invade does that without depending on a scissor rectangle. */
+static void bg_band(int y, int h) { gpu_draw_part(0, y, T_bg, 0, y, SCREEN_W, h); }
 
-/* Bake mode only: the staging canvas is transparent, so alpha must be composited too; otherwise the baked row comes out A=0
-   and blending it to screen at runtime draws nothing. Runs only at startup, scalar is fine. */
-static void blend_row_bake(uint32_t *dp, const uint32_t *sp, int n) {
-	for (int i = 0; i < n; i++) {
-		uint32_t c = sp[i], o = dp[i];
-		unsigned as = (c >> 24) & 0xff, ad = (o >> 24) & 0xff;
-		if (!as) continue;
-		unsigned na = as + (ad * (255 - as) >> 8);
-		unsigned r = (((c & 0xff) * as) + ((o & 0xff) * ad * (255 - as) >> 8)) / na;
-		unsigned g = ((((c >> 8) & 0xff) * as) + (((o >> 8) & 0xff) * ad * (255 - as) >> 8)) / na;
-		unsigned b = ((((c >> 16) & 0xff) * as) + (((o >> 16) & 0xff) * ad * (255 - as) >> 8)) / na;
-		dp[i] = (na << 24) | (b << 16) | (g << 8) | r;
-	}
-}
 
-static int baking; /* 1 = currently baking a row texture into the transparent staging canvas */
+/* ---------------- Native asset loading (.rgba under app0:assets) ----------------
+   Every asset uploads into a GPU texture once; raw pixels are dropped except the two pieces a
+   recolour is derived from (kept in the pool, a few hundred KB at most). */
+static uint32_t *sel_px, *back_px;
 
-static void blend(uint32_t *dp, const uint32_t *sp, int n) {
-	if (baking) blend_row_bake(dp, sp, n);
-	else blend_row(dp, sp, n);
-}
-
-/* Blend with strength factor k (0..254): scale the source alpha by k, then the same over formula.
-   The selection mask's breathing animation relies on it; k>=255 falls back to the exact blend_row. */
-static void blend_row_k(uint32_t *dp, const uint32_t *sp, int n, int k) {
-	int i = 0;
-	uint8x8_t kv = vdup_n_u8((uint8_t)k);
-	for (; i + 8 <= n; i += 8) {
-		uint8x8x4_t s = vld4_u8((const uint8_t *)(sp + i));
-		uint8x8x4_t o = vld4_u8((const uint8_t *)(dp + i));
-		s.val[3] = vshrn_n_u16(vaddq_u16(vmull_u8(s.val[3], kv), vdupq_n_u16(127)), 8);
-		uint8x8_t ia = vsub_u8(vdup_n_u8(255), s.val[3]);
-		uint8x8x4_t r;
-		for (int c = 0; c < 3; c++) {
-			uint16x8_t t = vaddq_u16(vmull_u8(o.val[c], ia), vmull_u8(s.val[c], s.val[3]));
-			t = vaddq_u16(t, vshrq_n_u16(t, 8));
-			t = vaddq_u16(t, vdupq_n_u16(128));
-			r.val[c] = vshrn_n_u16(t, 8);
-		}
-		r.val[3] = o.val[3];
-		vst4_u8((uint8_t *)(dp + i), r);
-	}
-	for (; i < n; i++) {
-		uint32_t c = sp[i];
-		int a = (int)((c >> 24) & 0xff) * k / 255;
-		if (!a) continue;
-		uint32_t o = dp[i];
-		uint32_t rr = (o & 0xff) + ((((int)(c & 0xff)) - (int)(o & 0xff)) * a >> 8);
-		uint32_t gg = ((o >> 8) & 0xff) + ((((int)((c >> 8) & 0xff)) - (int)((o >> 8) & 0xff)) * a >> 8);
-		uint32_t bb = ((o >> 16) & 0xff) + ((((int)((c >> 16) & 0xff)) - (int)((o >> 16) & 0xff)) * a >> 8);
-		dp[i] = (o & 0xff000000) | ((bb & 0xff) << 16) | ((gg & 0xff) << 8) | (rr & 0xff);
-	}
-}
-
-static void blend_k(uint32_t *dp, const uint32_t *sp, int n, int k) {
-	if (k >= 255) blend_row(dp, sp, n);
-	else blend_row_k(dp, sp, n, k);
-}
-
-/* Strength version of blend_into: runtime only (mask, reflections); baking never goes through here */
-static int blend_clip_y; /* When the list splits at the top/bottom, row content is clipped to the list area's top edge so it doesn't smear onto the top bar */
-static void blend_into_k(uint32_t *dst, int dst_h, int x, int y, const Spr *s, int k) {
-	if (!s->p) return;
-	int x0 = x < 0 ? -x : 0, y0 = y < blend_clip_y ? blend_clip_y - y : 0;
-	int x1 = s->w, y1 = s->h;
-	if (x + x1 > SCREEN_W) x1 = SCREEN_W - x;
-	if (y + y1 > dst_h) y1 = dst_h - y;
-	for (int j = y0; j < y1; j++)
-		blend_k(dst + (size_t)(y + j) * RENDER_PITCH + (x + x0),
-		        s->p + (size_t)j * s->w + x0, x1 - x0, k);
-}
-
-/* Blend a texture into an arbitrary destination buffer (full-screen canvas or a single row band); dst_h is the destination row count.
-   blend_clip_y: on top/bottom overscroll, row content is clipped to the list area's top edge so it doesn't smear onto the top bar */
-static void blend_into(uint32_t *dst, int dst_h, int x, int y, const Spr *s) {
-	if (!s->p) return;
-	int x0 = x < 0 ? -x : 0, y0 = y < blend_clip_y ? blend_clip_y - y : 0;
-	int x1 = s->w, y1 = s->h;
-	if (x + x1 > SCREEN_W) x1 = SCREEN_W - x;
-	if (y + y1 > dst_h) y1 = dst_h - y;
-	for (int j = y0; j < y1; j++)
-		blend(dst + (size_t)(y + j) * RENDER_PITCH + (x + x0),
-		      s->p + (size_t)j * s->w + x0, x1 - x0);
-}
-
-static void blit(int x, int y, const Spr *s) {
-	blend_into(render_cur_fb(), baking ? ROW_H : SCREEN_H, x, y, s);
-}
-
-/* Blend only the left fw columns of the texture (progress bar truncated by percentage) */
-static void blit_w(int x, int y, const Spr *s, int fw) {
-	if (!s->p || fw <= 0) return;
-	if (fw > s->w) fw = s->w;
-	uint32_t *fb = render_cur_fb();
-	int rows = s->h, lim = baking ? ROW_H : SCREEN_H;
-	if (y + rows > lim) rows = lim - y;
-	for (int j = 0; j < rows; j++)
-		blend(fb + (size_t)(y + j) * RENDER_PITCH + x,
-		      s->p + (size_t)j * s->w, fw);
-}
-
-/* Network icons: pixels live in data.c's fixed cache slots; a placeholder block until the download finishes */
-static void blit_icon(int x, int y, int kind, const char *url) {
-	int w, h;
-	const uint32_t *px = data_icon(kind, url, &w, &h);
-	Spr s = { (uint32_t *)px, w, h };
-	blend_into(render_cur_fb(), baking ? ROW_H : SCREEN_H, x, y, &s);
-}
-
-static void blit_bg(void) {
-	uint32_t *f = render_cur_fb();
-	for (int y = 0; y < SCREEN_H; y++)
-		memcpy(f + (size_t)y * RENDER_PITCH, bg + (size_t)y * SCREEN_W, SCREEN_W * 4);
-}
-
-/* ---------------- Native asset loading (.rgba under app0:assets) ---------------- */
-static uint32_t *load_rgba(const char *path, int w, int h) {
-	SceUID fd = sceIoOpen(path, SCE_O_RDONLY, 0);
-	if (fd < 0) { dlog("open fail %s 0x%x", path, fd); return NULL; }
-	uint32_t *buf = render_alloc((size_t)w * h * 4);
-	if (!buf) { dlog("alloc fail %s", path); sceIoClose(fd); return NULL; }
-	size_t need = (size_t)w * h * 4, got = 0;
-	while (got < need) {
-		int n = sceIoRead(fd, (char *)buf + got, need - got);
-		if (n <= 0) break;
-		got += n;
-	}
-	sceIoClose(fd);
-	if (got < need) { dlog("read fail %s got=%d/%d", path, (int)got, (int)need); return NULL; }
-	return buf;
-}
-
-static int load_one(Spr *s, const char *path, int w, int h) {
-	s->p = load_rgba(path, w, h);
-	s->w = s->p ? w : 0;
-	s->h = s->p ? h : 0;
-	return s->p ? 0 : -1;
+static vita2d_texture *load_tex(const char *path, int w, int h) {
+	vita2d_texture *t = gpu_tex_file(path, w, h);
+	if (!t) dlog("tex %s fail", path);
+	return t;
 }
 
 static int load_sprites(void) {
-	bg = load_rgba("app0:assets/bg.rgba", SCREEN_W, SCREEN_H);
-	if (!bg) return -1;
-	if (load_one(&S_sel, "app0:assets/sel.rgba", 960, SEL_H)) return -1;
-	if (load_one(&S_rowbg, "app0:assets/rowbg.rgba", 960, SEL_H)) return -1;
-	if (load_one(&S_legend, "app0:assets/legend.rgba", 182, 66)) return -1;
+	T_bg = load_tex("app0:assets/bg.rgba", SCREEN_W, SCREEN_H);
+	T_rowbg = load_tex("app0:assets/rowbg.rgba", 960, SEL_H);
+	T_legend = load_tex("app0:assets/legend.rgba", 182, 66);
 	static const char *c26[5] = { "app0:assets/cup26_0.rgba", "app0:assets/cup26_1.rgba",
 		"app0:assets/cup26_2.rgba", "app0:assets/cup26_3.rgba", "app0:assets/cup26_4.rgba" };
-	for (int k = 0; k < 5; k++)
-		if (load_one(&C_cup26[k], c26[k], 26, 26)) return -1;
+	for (int k = 0; k < 5; k++) T_cup26[k] = load_tex(c26[k], 26, 26);
+	if (!T_bg || !T_rowbg || !T_legend || !T_cup26[0]) return -1;
+
+	sel_px = gpu_read_file("app0:assets/sel.rgba", (size_t)960 * SEL_H * 4);
+	if (sel_px) T_sel = gpu_tex_upload(sel_px, 960, SEL_H);
 	/* If the back bubble can't be fetched, fall back to not drawing it; it must not stop the whole app from starting */
-	load_one(&S_back, "app0:assets/back.rgba", 110, 110);
-	return 0;
+	back_px = gpu_read_file("app0:assets/back.rgba", 110 * 110 * 4);
+	if (back_px) T_back = gpu_tex_upload(back_px, 110, 110);
+	return T_sel ? 0 : -1;
 }
 
-/* White row mask / teal bubble mask / white bubble mask: baked at startup by recoloring existing assets (the ↩ glyph stays white) */
+/* White row mask / teal bubble mask / white bubble mask: baked at startup by recolouring the native art (the ↩ glyph stays white) */
 static void bake_hl(void) {
-	if (S_sel.p && spr_alloc(&S_selw, S_sel.w, S_sel.h) == 0)
-		for (int i = 0; i < S_sel.w * S_sel.h; i++)
-			S_selw.p[i] = (S_sel.p[i] & 0xff000000u) | 0x00ffffffu;
-	if (!S_back.p) return;
-	if (spr_alloc(&S_bub_tl, S_back.w, S_back.h) < 0) return;
-	if (spr_alloc(&S_bub_w, S_back.w, S_back.h) < 0) return;
-	for (int i = 0; i < S_back.w * S_back.h; i++) {
-		uint32_t c = S_back.p[i];
-		int r = c & 255, g = (c >> 8) & 255, b = (c >> 16) & 255, a = (c >> 24) & 255;
-		S_bub_w.p[i] = ((uint32_t)a << 24) | 0x00ffffffu;
-		if (r > 200 && g > 200) { S_bub_tl.p[i] = c; continue; }
-		int t = (r * 30 + g * 59 + b * 11) / 100;
-		S_bub_tl.p[i] = ((uint32_t)a << 24) |
-		                ((uint32_t)(84 + (255 - 84) * t / 255) << 16) |
-		                ((uint32_t)(64 + (212 - 64) * t / 255) << 8) |
-		                (uint32_t)(4 + (18 - 4) * t / 255);
+	Spr s;
+	if (sel_px && spr_alloc(&s, 960, SEL_H) == 0) {
+		for (int i = 0; i < 960 * SEL_H; i++) s.p[i] = (sel_px[i] & 0xff000000u) | 0x00ffffffu;
+		T_selw = spr_tex(&s);
 	}
+	if (!back_px) return;
+	int n = 110 * 110;
+	if (spr_alloc(&s, 110, 110) == 0) {
+		for (int i = 0; i < n; i++) s.p[i] = (back_px[i] & 0xff000000u) | 0x00ffffffu;
+		T_bub_w = spr_tex(&s);
+	}
+	Spr tl;
+	if (spr_alloc(&tl, 110, 110) < 0) return;
+	for (int i = 0; i < n; i++) {
+		uint32_t c = back_px[i];
+		int r = c & 255, g = (c >> 8) & 255, b = (c >> 16) & 255, a = (c >> 24) & 255;
+		if (r > 200 && g > 200) { tl.p[i] = c; continue; }
+		int t = (r * 30 + g * 59 + b * 11) / 100;
+		tl.p[i] = ((uint32_t)a << 24) |
+	                ((uint32_t)(84 + (255 - 84) * t / 255) << 16) |
+	                ((uint32_t)(64 + (212 - 64) * t / 255) << 8) |
+	                (uint32_t)(4 + (18 - 4) * t / 255);
+	}
+	T_bub_tl = spr_tex(&tl);
 }
 
-/* ---------------- Startup baking ---------------- */
+/* ---------------- Startup parts ---------------- */
 static void bake_parts(void) {
 	/* Progress bar: native empty slot is light gray, earned portion is white */
-	if (spr_alloc(&S_track, BAR_W, BAR_H) == 0)
-		s_rrect(&S_track, 0, 0, BAR_W, BAR_H, BAR_H / 2, CA(205, 205, 205, 110));
-	if (spr_alloc(&S_fill, BAR_W, BAR_H) == 0)
-		s_rrect(&S_fill, 0, 0, BAR_W, BAR_H, BAR_H / 2, CA(255, 255, 255, 235));
-	/* Count panel: native is just a rounded base + 1px bright border, no separators between the four columns */
-	if (spr_alloc(&S_box, BOX_W, BOX_H) == 0) {
-		s_rrect(&S_box, 0, 0, BOX_W, BOX_H, 10, CA(16, 18, 24, 120));
-		s_rrect_border(&S_box, 0, 0, BOX_W, BOX_H, 10, CA(255, 255, 255, 40));
+	Spr s;
+	if (spr_alloc(&s, BAR_W, BAR_H) == 0) {
+		s_rrect(&s, 0, 0, BAR_W, BAR_H, BAR_H / 2, CA(205, 205, 205, 110));
+		T_track = spr_tex(&s);
 	}
-	if (spr_alloc(&S_play, 15, 28) == 0)
-		for (int j = 0; j < 28; j++) {
-			int len = 14 - abs(j - 13);
-			for (int k = 0; k <= len; k++) s_px(&S_play, k, j, CA(235, 235, 235, 220));
-		}
-	if (spr_alloc(&S_dlc, 24, 24) == 0) {
+	if (spr_alloc(&s, BAR_W, BAR_H) == 0) {
+		s_rrect(&s, 0, 0, BAR_W, BAR_H, BAR_H / 2, CA(255, 255, 255, 235));
+		T_fill = spr_tex(&s);
+	}
+	/* Count panel: native is just a rounded base + 1px bright border, no separators between the four columns */
+	if (spr_alloc(&s, BOX_W, BOX_H) == 0) {
+		s_rrect(&s, 0, 0, BOX_W, BOX_H, 10, CA(16, 18, 24, 120));
+		s_rrect_border(&s, 0, 0, BOX_W, BOX_H, 10, CA(255, 255, 255, 40));
+		T_box = spr_tex(&s);
+	}
+	if (spr_alloc(&s, 24, 24) == 0) {
 		for (int j = -11; j <= 11; j++)
 			for (int i = -11; i <= 11; i++)
-				if (i * i + j * j <= 121) s_px(&S_dlc, 12 + i, 12 + j, C(96, 98, 104) | 0xff000000);
+				if (i * i + j * j <= 121) s_px(&s, 12 + i, 12 + j, C(96, 98, 104));
 		for (int k = -7; k <= 7; k++) {
-			s_px(&S_dlc, 12, 12 + k, C(245, 245, 245) | 0xff000000);
-			s_px(&S_dlc, 12 + k, 12, C(245, 245, 245) | 0xff000000);
+			s_px(&s, 12, 12 + k, C(245, 245, 245));
+			s_px(&s, 12 + k, 12, C(245, 245, 245));
 		}
+		T_dlc = spr_tex(&s);
 	}
 	/* Top-left search box: replaces the native PS Vita tab's spot, same height as the original tab */
-	if (spr_alloc(&S_field, SB_W2, SB_H2) == 0) {
-		s_rrect(&S_field, 0, 0, SB_W2, SB_H2, 12, CA(18, 20, 26, 150));
-		s_rrect_border(&S_field, 0, 0, SB_W2, SB_H2, 12, CA(190, 200, 215, 70));
+	if (spr_alloc(&s, SB_W2, SB_H2) == 0) {
+		s_rrect(&s, 0, 0, SB_W2, SB_H2, 12, CA(18, 20, 26, 150));
+		s_rrect_border(&s, 0, 0, SB_W2, SB_H2, 12, CA(190, 200, 215, 70));
+		T_field = spr_tex(&s);
 	}
 }
 
-/* ---------------- Row content (selected rows keep white text too, as in native) ----------------
-   y is the row top; baked into a screen-wide transparent staging canvas, cropped to 960x90 as the row texture.
-   Network icons are not baked in: they can arrive at any time and one bake would invalidate the whole batch, so they are blended as a separate layer at runtime. */
+/* ---------------- Row content ----------------
+   Rows are drawn straight into the frame every vsync: a textured quad per sprite and one draw call
+   per string is cheaper on the GPU than the old CPU bake-and-memcpy round trip, so the row-texture
+   cache and the whole clean-snapshot machinery are gone. */
 static void fmt_pct(int p100, char *buf, int cap) {
 	snprintf(buf, cap, "%d.%02d%%", p100 / 100, p100 % 100);
 }
 
 static void row_counts(int y, const int cnt[4]) {
-	blit(BOX_X, y + BOX_Y, &S_box);
+	gpu_draw(BOX_X, y + BOX_Y, T_box);
 	for (int k = 0; k < 4; k++) {
 		char d[8];
 		snprintf(d, sizeof(d), "%d", cnt[k]);
-		render_text(DIG_X + k * 50 - render_text_width(d, 28) / 2, y + 54, d,
-		            cnt[k] ? C(245, 245, 245) : C(120, 120, 120), 28);
+		gpu_text(DIG_X + k * 50 - gpu_text_w(d, 28) / 2, y + 54, d,
+		         cnt[k] ? C(245, 245, 245) : C(120, 120, 120), 28);
 	}
 }
 
@@ -495,30 +357,30 @@ static void row_counts(int y, const int cnt[4]) {
 static void row_bar(int y, int p100) {
 	if (p100 <= 0) return;
 	int fw = BAR_W * p100 / 10000;
-	blit(BAR_X, y + BAR_Y, &S_track);
-	if (fw > 0) blit_w(BAR_X, y + BAR_Y, &S_fill, fw < BAR_H ? BAR_H : fw);
+	gpu_draw(BAR_X, y + BAR_Y, T_track);
+	if (fw > 0) gpu_draw_part(BAR_X, y + BAR_Y, T_fill, 0, 0, fw, BAR_H);
 	char b[16];
 	fmt_pct(p100, b, sizeof(b));
-	render_text(PCT_X, y + 66, b, C(235, 235, 235), 20);
+	gpu_text(PCT_X, y + 66, b, C(235, 235, 235), 20);
 }
 
 /* Levels 1-2: games / trophy groups */
 static void draw_row_set(int y, const char *name, const char *sub, int p100,
                          const int cnt[4], int dlc) {
-	render_text_clip(TXT_X, y + 40, name, C(245, 245, 245), 26, TXT_W);
-	if (sub && sub[0]) render_text_clip(TXT_X, y + 66, sub, C(150, 150, 150), 16, TXT_W);
+	gpu_text_clip(TXT_X, y + 40, name, C(245, 245, 245), 26, TXT_W);
+	if (sub && sub[0]) gpu_text_clip(TXT_X, y + 66, sub, C(150, 150, 150), 16, TXT_W);
 	else row_bar(y, p100);
 	row_counts(y, cnt);
-	if (dlc) blit(ICON_X + 6, y + 58, &S_dlc);
+	if (dlc) gpu_draw(ICON_X + 6, y + 58, T_dlc);
 }
 
-/* Level 3: trophies. The 90x90 trophy image on the left is composited at runtime; here we only bake the text and the right-side info */
+/* Level 3: trophies. The 90x90 trophy image on the left is a network icon drawn separately. */
 static void draw_row_trophy(int y, const PsTrophy *t) {
-	blit(TXT_X, y + 14, &C_cup26[cup_of(t->type)]);
-	render_text_clip(TXT_X + 36, y + 40, t->cn[0] ? t->cn : t->name, C(245, 245, 245), 22,
-	                 TXT_W - 36);
+	gpu_draw(TXT_X, y + 14, T_cup26[cup_of(t->type)]);
+	gpu_text_clip(TXT_X + 36, y + 40, t->cn[0] ? t->cn : t->name, C(245, 245, 245), 22,
+	              TXT_W - 36);
 	if (t->detail[0])
-		render_text_clip(TXT_X + 36, y + 66, t->detail, C(160, 160, 160), 15, TXT_W - 36);
+		gpu_text_clip(TXT_X + 36, y + 66, t->detail, C(160, 160, 160), 15, TXT_W - 36);
 	char b[64];
 	if (t->rarity100 > 0) {
 		char pc[16];
@@ -527,18 +389,18 @@ static void draw_row_trophy(int y, const PsTrophy *t) {
 	} else {
 		snprintf(b, sizeof(b), "%s", t->rarity);
 	}
-	render_text_clip(INFO_X, y + 40, b, C(150, 210, 150), 16, INFO_W);
+	gpu_text_clip(INFO_X, y + 40, b, C(150, 210, 150), 16, INFO_W);
 	snprintf(b, sizeof(b), "%d Tips", t->tips_count);
-	render_text_clip(INFO_X, y + 66, b,
-	                 t->tips_count ? C(120, 190, 255) : C(110, 110, 110), 16, INFO_W);
+	gpu_text_clip(INFO_X, y + 66, b,
+	              t->tips_count ? C(120, 190, 255) : C(110, 110, 110), 16, INFO_W);
 }
 
 /* Level 4: one tip's header + two-line body summary */
 static void draw_row_tip(int y, const PsTip *t) {
 	char head[176];
 	snprintf(head, sizeof(head), "%s  ·  %s", t->author, t->date);
-	render_text_clip(110, y + 26, head, C(150, 200, 255), 16, 800);
-	render_text_wrap(110, y + 52, t->content, C(225, 225, 225), 18, 800, 2);
+	gpu_text_clip(110, y + 26, head, C(150, 200, 255), 16, 800);
+	gpu_text_wrap(110, y + 52, t->content, C(225, 225, 225), 18, 800, 2);
 }
 
 static void draw_row(int scr, int item, int y) {
@@ -565,62 +427,19 @@ static void draw_row(int scr, int item, int y) {
 	}
 }
 
-/* ---------------- Row texture cache ----------------
-   Baking a batch at startup no longer makes sense (data waits on the network), so bake on demand:
-   key = (screen, item, data generation); a data generation change auto-invalidates old rows, and only the visible rows are baked. */
-typedef struct {
-	uint32_t *px;
-	int scr, item, gen;
-	unsigned age;
-} RowSlot;
-
-static RowSlot rc[MAX_CACHE];
-static unsigned rc_age;
-static uint32_t *bake_buf; /* ROW_H x RENDER_PITCH transparent staging canvas */
-
-static uint32_t *row_tex(int scr, int item) {
-	if (!bake_buf || item < 0) return NULL;
-	int gen = gen_of(scr);
-	for (int i = 0; i < MAX_CACHE; i++) {
-		if (rc[i].px && rc[i].scr == scr && rc[i].item == item && rc[i].gen == gen) {
-			rc[i].age = ++rc_age;
-			return rc[i].px;
-		}
-	}
-	int v = -1;
-	for (int i = 0; i < MAX_CACHE; i++) {
-		if (!rc[i].px) { v = i; break; }
-		if (v < 0 || rc[i].age < rc[v].age) v = i;
-	}
-	if (!rc[v].px) rc[v].px = render_alloc0((size_t)ROW_H * SCREEN_W * 4);
-	if (!rc[v].px) return NULL;
-	uint32_t *d = rc[v].px;
-	memset(d, 0, (size_t)ROW_H * SCREEN_W * 4);
-	render_set_target(bake_buf);
-	baking = 1;
-	render_set_bake_alpha(1);
-	draw_row(scr, item, 0);
-	render_set_bake_alpha(0);
-	baking = 0;
-	render_set_target(NULL);
-	for (int j = 0; j < ROW_H; j++)
-		memcpy(d + (size_t)j * SCREEN_W, bake_buf + (size_t)j * RENDER_PITCH, SCREEN_W * 4);
-	memset(bake_buf, 0, (size_t)ROW_H * RENDER_PITCH * 4);
-	rc[v].scr = scr;
-	rc[v].item = item;
-	rc[v].gen = gen;
-	rc[v].age = ++rc_age;
-	return d;
+/* Full-width SEL_H mask (selection band / white flash) clamped to the list area: a row sliding out
+   at the top must not smear its mask over the header, and the GPU has no per-row dirty bookkeeping
+   to lean on here. */
+static void row_mask(int lt, vita2d_texture *tex, int y, int k) {
+	if (!tex || k <= 0) return;
+	int ty = y < lt ? lt : y;
+	int by = y + SEL_H > SCREEN_H ? SCREEN_H : y + SEL_H;
+	if (by <= ty) return;
+	if (k >= 255) gpu_draw_part(0, ty, tex, 0, ty - y, SCREEN_W, by - ty);
+	else gpu_draw_part_a(0, ty, tex, 0, ty - y, SCREEN_W, by - ty, k);
 }
 
-/* ---------------- Row-band base images and list snapshot ----------------
-   bandbg: bg slice + native unselected-row texture, baked at startup, memcpy'd as a whole block while scrolling.
-   clean : snapshot of the whole list after the foreground is drawn (no selection mask). Each frame the mask first
-           restores the rows it swept over to clean before overlaying; otherwise blending the same translucent mask onto the same row keeps brightening it. */
-static uint32_t *bandbg[SCR_N][MAX_ROW];
-static uint32_t *clean[SCR_N];
-
-/* ---------------- Top/bottom overscroll separation (native row gaps when pulled past the top) ----------------
+/* ---------------- Overscroll separation (native row gaps when pulled past the top) ----------------
    ov_e is the current split amount (positive = pulled past top, negative = pushed past bottom); while tracking the finger it equals ov_tgt directly,
    and after release ov_tick springs back to 0 over 260ms with cubic easing.
    The gap is uniform: the anchored end stays put and the offset spreads linearly with the row index (native screenshots measure
@@ -745,41 +564,18 @@ static int flash_idx = -1, flash_k;
 static long long flash_t0;
 static int glow_on;
 static long long glow_last;
+static int glow_y, glow_from, glow_to, glow_anim;
+static int glow_k = 255;
+static long long glow_t0;
 static int bk_focus;
 static long long bub_t0 = -1;
 
-static int band_h(int scr, int pos) {
-	int h = SCREEN_H - (lt_of(scr) + pos * ROW_H);
-	return h > ROW_H ? ROW_H : h;
-}
-
-static void bake_bands(void) {
-	for (int scr = 0; scr < SCR_N; scr++) {
-		/* The level-5 reading page draws no list and has no selection mask; row bands and snapshots are unused */
-		if (scr == SCR_TIPVIEW) continue;
-		int s0 = snap0_of(scr);
-		clean[scr] = render_alloc((size_t)(SCREEN_H - s0) * RENDER_PITCH * 4);
-		if (!clean[scr]) dlog("clean alloc fail");
-		for (int p = 0; p < rows_draw(scr); p++) {
-			int y = lt_of(scr) + p * ROW_H, h = band_h(scr, p);
-			uint32_t *d = render_alloc((size_t)h * RENDER_PITCH * 4);
-			bandbg[scr][p] = d;
-			if (!d) { dlog("band alloc fail"); continue; }
-			for (int j = 0; j < h; j++)
-				memcpy(d + (size_t)j * RENDER_PITCH, bg + (size_t)(y + j) * SCREEN_W,
-				       SCREEN_W * 4);
-			blend_into(d, h, 0, -1, &S_rowbg); /* Texture is 1px taller than the row band on top and bottom */
-		}
-	}
-}
-
 /* ---------------- Top bar / hints / top-right spinner ---------------- */
-static Spr S_spin[8]; /* Eight spinner frames, positioned like the loading animation on the native PSN page */
 
 static void bake_spinner(void) {
+	Spr s;
 	for (int f = 0; f < 8; f++) {
-		if (spr_alloc(&S_spin[f], SPN_S, SPN_S) < 0) return;
-		Spr *s = &S_spin[f];
+		if (spr_alloc(&s, SPN_S, SPN_S) < 0) return;
 		int cx = SPN_S / 2, cy = SPN_S / 2;
 		for (int i = 0; i < 8; i++) {
 			int a = (i + 8 - f) & 7;           /* Newer tail segments are brighter */
@@ -790,40 +586,32 @@ static void bake_spinner(void) {
 				float rr = (float)t / 4.f;
 				int x = cx + (int)(rr * cosf(ang));
 				int y = cy + (int)(rr * sinf(ang));
-				if (x < 0 || x >= s->w || y < 0 || y >= s->h) continue;
-				s_px(s, x, y, CA(235, 240, 245, al));
-				s_px(s, x + 1, y, CA(235, 240, 245, al * 2 / 3));
-				s_px(s, x, y + 1, CA(235, 240, 245, al * 2 / 3));
+				s_px(&s, x, y, CA(235, 240, 245, al));
+				s_px(&s, x + 1, y, CA(235, 240, 245, al * 2 / 3));
+				s_px(&s, x, y + 1, CA(235, 240, 245, al * 2 / 3));
 			}
 		}
+		T_spin[f] = spr_tex(&s);
 	}
 }
 
+/* f<0: nothing to show; the whole screen is repainted each frame, so no background restore is needed */
 static int spin_shown = -1;
 
-/* f<0: restore this area to the background (spinner finished) */
 static void draw_spinner(int f) {
-	if (f == spin_shown) return;
-	spin_shown = f;
-	uint32_t *fb = render_cur_fb();
-	int y0 = SPN_Y - 4, y1 = SPN_Y + SPN_S + 4;
-	for (int y = y0; y < y1; y++)
-		memcpy(fb + (size_t)y * RENDER_PITCH + SPN_X - 4, bg + (size_t)y * SCREEN_W + SPN_X - 4,
-		       (SPN_S + 8) * 4);
-	if (f >= 0 && S_spin[f].p) blend_into(fb, SCREEN_H, SPN_X, SPN_Y, &S_spin[f]);
-	render_mark_dirty(y0, y1 - y0);
+	if (f >= 0) gpu_draw(SPN_X, SPN_Y, T_spin[f]);
 }
 
 static void draw_topbar(void) {
-	blit(SRCH_X, SRCH_Y, &S_field);
+	gpu_draw(SRCH_X, SRCH_Y, T_field);
 	if (query[0]) {
 		char b[128];
 		snprintf(b, sizeof(b), "搜索：%s", query);
-		render_text_clip(SRCH_X + 14, 88, b, C(235, 238, 242), 18, SB_W2 - 28);
+		gpu_text_clip(SRCH_X + 14, 88, b, C(235, 238, 242), 18, SB_W2 - 28);
 	} else {
-		render_text_clip(SRCH_X + 14, 88, "搜索游戏（按 △）", C(150, 155, 165), 18, SB_W2 - 28);
+		gpu_text_clip(SRCH_X + 14, 88, "搜索游戏（按 △）", C(150, 155, 165), 18, SB_W2 - 28);
 	}
-	blit(668, 47, &S_legend); /* Native texture: the four trophies include their own reflection, 66 high, centered in 32..128 */
+	gpu_draw(668, 47, T_legend); /* Native texture: the four trophies include their own reflection, 66 high, centered in 32..128 */
 }
 
 static void draw_hint(int scr) {
@@ -837,59 +625,51 @@ static void draw_hint(int scr) {
 	else if (scr == SCR_TIPS) snprintf(buf, sizeof(buf), "%s 读全文   %s 返回", ok, bk);
 	else snprintf(buf, sizeof(buf), "上下翻正文   %s 返回", bk);
 	if (scr == SCR_TIPVIEW) {
-		render_text(HINT_X, 94, buf, C(150, 150, 150), 16);
+		gpu_text(HINT_X, 94, buf, C(150, 150, 150), 16);
 		return;
 	}
 	/* List pages: hint moves up one notch, source attribution on the line below */
-	render_text(HINT_X, 68, buf, C(150, 150, 150), 16);
-	render_text(HINT_X, 94, "数据实时查询自 psnine.com", C(110, 115, 122), 14);
+	gpu_text(HINT_X, 68, buf, C(150, 150, 150), 16);
+	gpu_text(HINT_X, 94, "数据实时查询自 psnine.com", C(110, 115, 122), 14);
 }
 
 /* ---------------- Bottom-left back button (non-level-1 pages) ----------------
    Like native, a circular bubble partly clipped by the bottom-left corner: measured from native screenshots,
-   center (30,522), radius 55, with the ↩ arrow sitting slightly above the middle of the visible bubble area. */
+   center (30,522), radius 55, with the ↩ arrow sitting slightly above the middle of the visible bubble area.
+   The negative x is fine on the GPU: the quad simply extends past the left edge and the hardware clips it. */
 #define BUB_X   -25
 #define BUB_Y   467
 #define BUB_HIT_X 92
 #define BUB_HIT_Y 462
 
 static void draw_back_btn(int scr) {
-	if (scr == SCR_GAMES || !S_back.p) return;
-	blit(BUB_X, BUB_Y, &S_back);
-	uint32_t *fb = render_cur_fb();
+	if (scr == SCR_GAMES || !T_back) return;
+	gpu_draw(BUB_X, BUB_Y, T_back);
 	if (bub_t0 >= 0) {   /* Touching the bubble: white mask plays from opaque to transparent */
 		long long t = sceKernelGetProcessTimeWide() - bub_t0;
 		int k = 255 - (int)(t * 255 / BUB_FLASH_US);
-		if (k > 0) blend_into_k(fb, SCREEN_H, BUB_X, BUB_Y, &S_bub_w, k);
+		gpu_draw_a(BUB_X, BUB_Y, T_bub_w, k);
 	} else if (bk_focus) {
-		blend_into_k(fb, SCREEN_H, BUB_X, BUB_Y, &S_bub_tl, 255);
+		gpu_draw(BUB_X, BUB_Y, T_bub_tl);
 	}
 }
 
-/* Scrollbar: draw only the part overlapping [y0,y1); animation doesn't dirty the whole screen */
-static void draw_scrollbar(int scr, int y0, int y1) {
+/* Scrollbar: track drawn in the two segments around the thumb, so the translucent layers never stack */
+static void draw_scrollbar(int scr) {
 	int lt = lt_of(scr), n = cnt_of(scr), vh = rows_vis(scr);
 	int th = SCREEN_H - 8 - lt;
 	if (n <= vh || th <= 0) return;
 	int dh = th * vh / n;
 	if (dh < 24) dh = 24;
 	int dy = lt + (th - dh) * top_of(scr) / (n - vh);
-	if (y0 < lt) y0 = lt;
-	if (y1 > lt + th) y1 = lt + th;
-	if (y1 <= y0) return;
-	uint32_t trk[SB_W], hub[SB_W], cap[SB_W];
-	for (int i = 0; i < SB_W; i++) {
-		trk[i] = CA(140, 140, 140, 30);
-		hub[i] = CA(200, 200, 200, 160);
-		cap[i] = CA(200, 200, 200, 70);
-	}
-	uint32_t *fb = render_cur_fb();
-	for (int r = y0; r < y1; r++) {
-		int k = r - dy;
-		const uint32_t *c = (k < 0 || k >= dh) ? trk : (k == 0 || k == dh - 1) ? cap : hub;
-		blend_row(fb + (size_t)r * RENDER_PITCH + SB_X, c, SB_W);
-	}
-	render_mark_dirty(y0, y1 - y0);
+	if (dy < lt) dy = lt;
+	if (dy + dh > lt + th) dy = lt + th - dh;
+	const uint32_t trk = CA(140, 140, 140, 30), hub = CA(200, 200, 200, 160), cap = CA(200, 200, 200, 70);
+	gpu_rect(SB_X, lt, SB_W, dy - lt, trk);
+	gpu_rect(SB_X, dy + dh, SB_W, lt + th - dy - dh, trk);
+	gpu_rect(SB_X, dy, SB_W, dh, hub);
+	gpu_rect(SB_X, dy, SB_W, 1, cap);
+	gpu_rect(SB_X, dy + dh - 1, SB_W, 1, cap);
 }
 
 /* One-line note for empty lists: "loading" while in flight; on failure show the error code and press ○ to retry */
@@ -898,119 +678,75 @@ static void draw_empty_note(int scr) {
 	if (data_err() < 0) {
 		snprintf(b, sizeof(b), "加载失败 %x，按 %s 重试", (unsigned)(-data_err()),
 		         ok_btn == SCE_CTRL_CIRCLE ? "○" : "×");
-		render_text(120, lt_of(scr) + 40, b, C(255, 120, 120), 20);
+		gpu_text(120, lt_of(scr) + 40, b, C(255, 120, 120), 20);
 	} else if (data_busy()) {
 		snprintf(b, sizeof(b), "正在加载…");
-		render_text(120, lt_of(scr) + 40, b, C(150, 150, 150), 20);
+		gpu_text(120, lt_of(scr) + 40, b, C(150, 150, 150), 20);
 	} else if (scr == SCR_TIPS) {
-		render_text(120, lt_of(scr) + 40, "这条奖杯还没有人写过 Tips", C(150, 150, 150), 20);
+		gpu_text(120, lt_of(scr) + 40, "这条奖杯还没有人写过 Tips", C(150, 150, 150), 20);
 	}
-	render_mark_dirty(snap0_of(scr), SCREEN_H - snap0_of(scr));
 }
 
-/* ---------------- List drawing ---------------- */
-/* Trophy icons only trust PSN's: leave blank until fetched, no native placeholder cup.
-   But data_icon must still be called — download registration/retries live inside it; only checking state means the request never gets sent */
-static void blit_cup(int x, int y, const PsTrophy *t) {
-	if (!t->icon[0]) return;
+/* ---------------- List drawing ----------------
+   Covers and trophy balls are PSN images cached as textures by gpu.c. gpu_icon has to be called on
+   every pass even while an icon is still missing: the download registration and retries live inside it. */
+static void draw_icon_at(int x, int y, int kind, const char *url, int show_ph) {
 	int w, h;
-	const uint32_t *px = data_icon(IC_CUP, t->icon, &w, &h);
-	if (data_icon_state(IC_CUP, t->icon) != DI_READY) return;
-	Spr s = { (uint32_t *)px, w, h };
-	blend_into(render_cur_fb(), baking ? ROW_H : SCREEN_H, x, y, &s);
+	vita2d_texture *t = gpu_icon(kind, url, &w, &h);
+	if (!t) return;
+	/* Every icon slot sits at x>=ICON_X, so a smaller x is a bug worth a log line: one appeared
+	   over the search box in a device screenshot and no call site can account for it. */
+	if (x < 60) dlog("icon@%d,%d %dx%d k=%d %.48s", x, y, w, h, kind, url);
+	int st = data_icon_state(kind, url);
+	if (st == DI_READY) {
+		gpu_draw(x, y, t);
+		return;
+	}
+	/* Trophy balls only ever show PSN's art: no gray placeholder box */
+	if (show_ph) gpu_draw(x, y, t);
+	/* Still in flight: spin the same loader in the middle of the slot, so an empty icon reads as
+	   "downloading" rather than "this game has no art". A failure keeps the static placeholder. */
+	if (st != DI_FAIL && spin_shown >= 0 && w >= SPN_S && h >= SPN_S)
+		gpu_draw(x + (w - SPN_S) / 2, y + (h - SPN_S) / 2, T_spin[spin_shown]);
 }
 
 static void row_icon(int scr, int item, int y) {
-	if (scr == SCR_GAMES) blit_icon(ICON_X, y + 3, IC_COVER, dt_list[item].icon);
-	else if (scr == SCR_GROUPS) blit_icon(ICON_X, y + 3, IC_COVER, dt_head.icon);
-	else if (scr == SCR_TROPHIES) blit_cup(ICON_X + 32, y, &dt_trophy[item]);
-}
-
-/* Lay the row-band base back over the whole visible area. The last row is shorter than ROW_H and band_h already clipped it to the screen edge,
-   so the base fills all the way to SCREEN_H with no gap below (old thumbs no longer get scorched into the gap). */
-static void rows_bg(int scr) {
-	int lt = lt_of(scr), vh = rows_draw(scr), fr = view_fr(scr);
-	uint32_t *fb = render_cur_fb();
-	if (ov_e || fr) { /* Splitting/sliding: lay the whole list area back to the background first, then paste row bands at their offsets */
-		for (int r = lt; r < SCREEN_H; r++)
-			memcpy(fb + (size_t)r * RENDER_PITCH, bg + (size_t)r * SCREEN_W, SCREEN_W * 4);
-	}
-	for (int i = -1; i <= vh; i++) {
-		int y = lt + i * ROW_H - fr + sep_of(i, vh), h = band_h(scr, i);
-		int so = 0;                    /* Row pokes above the list area's top edge: clip off the protruding part */
-		if (y < lt) { so = lt - y; y = lt; }
-		if (y + h > SCREEN_H) h = SCREEN_H - y;
-		h -= so;
-		if (h <= 0 || i < 0 || i >= vh || !bandbg[scr][i]) continue;
-		memcpy(fb + (size_t)y * RENDER_PITCH, bandbg[scr][i] + (size_t)so * RENDER_PITCH,
-		       (size_t)h * RENDER_PITCH * 4);
-	}
-	/* Row count includes partial rows (rows_draw); bandbg already fills to SCREEN_H, no gap patching needed */
-}
-
-static void clean_snap(int scr) {
-	/* Rows are displaced while splitting/sliding; writing them into the snapshot would make mask restoration pull the displaced rows back: record only once settled */
-	if (!clean[scr] || ov_e || view_fr(scr)) return;
-	int s0 = snap0_of(scr);
-	uint32_t *fb = render_cur_fb();
-	for (int r = s0; r < SCREEN_H; r++)
-		memcpy(clean[scr] + (size_t)(r - s0) * RENDER_PITCH, fb + (size_t)r * RENDER_PITCH,
-		       SCREEN_W * 4);
+	if (scr == SCR_GAMES) draw_icon_at(ICON_X, y + 3, IC_COVER, dt_list[item].icon, 1);
+	else if (scr == SCR_GROUPS) draw_icon_at(ICON_X, y + 3, IC_COVER, dt_head.icon, 1);
+	else if (scr == SCR_TROPHIES) draw_icon_at(ICON_X + 32, y, IC_CUP, dt_trophy[item].icon, 0);
 }
 
 static void paint_list(int scr) {
 	int top = top_of(scr), n = cnt_of(scr), lt = lt_of(scr), vh = rows_draw(scr);
 	int fr = view_fr(scr);
-	uint32_t *fb = render_cur_fb();
-	rows_bg(scr);
-	if (!n) {
-		draw_empty_note(scr);
-		draw_back_btn(scr);
-		clean_snap(scr);
-		render_mark_dirty(snap0_of(scr), SCREEN_H - snap0_of(scr));
-		return;
-	}
-	blend_clip_y = lt; /* On top/bottom overscroll split or slide, row content is clipped inside the list area */
+	/* One pass per visible row: the native band, then its content, then the network icon.
+	   Sliding and the overscroll gap are just row positions, and anything that leaves the list area
+	   gets painted over by the chrome bands afterwards. */
 	for (int i = -1; i <= vh; i++) {
 		int idx = top + i;
 		if (idx < 0 || idx >= n) continue;
 		int y = lt + i * ROW_H - fr + sep_of(i, vh);
 		if (y + ROW_H <= lt || y >= SCREEN_H) continue;
 		int item = item_of(scr, idx);
-		if (i < 0 || i >= vh) blend_into(fb, SCREEN_H, 0, y - 1, &S_rowbg); /* Sliding-in rows have no row band */
-		uint32_t *tex = row_tex(scr, item);
-		if (tex) {
-			Spr s = { tex, SCREEN_W, ROW_H };
-			blend_into(fb, SCREEN_H, 0, y, &s);
-		}
+		gpu_draw(0, y - 1, T_rowbg);
+		draw_row(scr, item, y);
 		row_icon(scr, item, y);
 	}
-	if (flash_idx >= 0 && flash_k > 0) {   /* Flash the touch-start row white once */
-		int i = flash_idx - top;
-		if (i >= -1 && i <= vh)
-			blend_into_k(fb, SCREEN_H, 0, lt + i * ROW_H - fr + sep_of(i, vh) - 1, &S_selw, flash_k);
-	}
-	blend_clip_y = 0;
-	/* The scrollbar must be scorched into the snapshot: the thumb only moves with top, and top stays put while the cursor moves within a page,
-	   so restoring rows during breathing frames won't leave an old thumb in place or stack the same gray layer over and over. */
-	draw_scrollbar(scr, 0, SCREEN_H);
-	draw_back_btn(scr);
-	clean_snap(scr);
-	render_mark_dirty(snap0_of(scr), SCREEN_H - snap0_of(scr));
+	if (!n) draw_empty_note(scr);
+	if (flash_idx >= 0 && flash_k > 0)   /* Flash the touch-start row white once */
+		row_mask(lt, T_selw, lt + (flash_idx - top) * ROW_H - fr + sep_of(flash_idx - top, vh) - 1,
+		         flash_k);
+	if (glow_on && n > 0) row_mask(lt, T_sel, glow_y, glow_k);
 }
 
-/* ---------------- Selection mask easing + breathing ---------------- */
+/* ---------------- Selection mask easing + breathing ----------------
+   With the whole frame repainted each vsync the mask is simply one more overlay: no snapshot to
+   restore and no accumulation to undo, so this section only tracks a position and an intensity. */
 #define GLOW_US   140000LL
 #define GLOW_CUBE (GLOW_US * GLOW_US * GLOW_US)
-#define FRAME_US  16667LL
 #define PULSE_US  1250000LL    /* One full cycle of mask depth breathing */
 #define PULSE_MID 195          /* Center intensity (255 = texture as-is) */
 #define PULSE_AMP 60           /* Swing: 135~255, the teal light brightening and dimming */
-#define PULSE_FRAME 33333LL    /* Breathing only needs 30fps, saving half the cost of the movement animation */
-
-static int glow_y, glow_from, glow_to, glow_anim;
-static int glow_k = 255;
-static long long glow_t0, glow_next;
 
 /* The native mask is a blue-green light band whose brightness periodically deepens and lightens */
 static int pulse_k(long long now) {
@@ -1023,199 +759,93 @@ static int glow_target(int scr) {
 	       sep_of(cur_of(scr) - top_of(scr), rows_draw(scr));
 }
 
-static void glow_at(int y, int scr, int r0, int r1) {
-	uint32_t *fb = render_cur_fb();
-	/* Don't lay the selection band while the list is still empty: in native, with no selection the row is just background; we earlier made it breathe.
-	   No need to redraw the scrollbar here: it's already scorched into the clean snapshot and comes back naturally when rows are restored */
-	if (cnt_of(scr) > 0) {
-		blend_clip_y = lt_of(scr) - 1; /* The mask is inherently 1px taller than the row (snap0); clip to here when pushed past the bottom */
-		blend_into_k(fb, SCREEN_H, 0, y, &S_sel, glow_k);
-		blend_clip_y = 0;
-	}
-	render_mark_dirty(r0, r1 - r0);
-}
-
-static void glow_snap(int y, int scr) {
-	int s0 = snap0_of(scr);
-	int r0 = y < s0 ? s0 : y;
-	int r1 = y + SEL_H > SCREEN_H ? SCREEN_H : y + SEL_H;
+/* Jump onto the row without animating: used when the mask first lights up, so it never slides in from a stale position */
+static void glow_snap(int y) {
 	glow_y = y;
 	glow_anim = 0;
-	glow_at(y, scr, r0, r1);
 }
 
-static void glow_start(int to, long long now) {
-	glow_from = glow_y;
-	glow_to = to;
-	glow_t0 = now;
-	glow_anim = 1;
-}
-
-/* Restore [r0,r1) to the clean mask-less snapshot, then overlay the mask at y with the current intensity */
-static void glow_redraw(int scr, int r0, int r1, int y) {
-	uint32_t *fb = render_cur_fb();
-	int s0 = snap0_of(scr);
-	if (clean[scr])
-		for (int r = r0; r < r1; r++)
-			memcpy(fb + (size_t)r * RENDER_PITCH,
-			       clean[scr] + (size_t)(r - s0) * RENDER_PITCH, SCREEN_W * 4);
-	glow_at(y, scr, r0, r1);
-}
-
-static void glow_band_rows(int scr, int *r0, int *r1) {
-	int s0 = snap0_of(scr);
-	*r0 = glow_y < s0 ? s0 : glow_y;
-	*r1 = glow_y + SEL_H > SCREEN_H ? SCREEN_H : glow_y + SEL_H;
-}
-
-/* Idle breathing frame: redraw only the few rows the mask swept over */
-static int pulse_tick(long long now, int scr) {
-	if (now < glow_next) return -1;
-	glow_next = now + PULSE_FRAME;
-	int k = pulse_k(now);
-	if (k == glow_k) return -1;
-	glow_k = k;
-	int r0, r1;
-	glow_band_rows(scr, &r0, &r1);
-	glow_redraw(scr, r0, r1, glow_y);
-	return 1;
-}
-
-/* Returns 1 = screen updated, 0 = in place with no change, -1 = next frame not due yet */
-static int glow_step(long long now, int scr) {
-	if (now < glow_next) return -1;
-	glow_next = now + FRAME_US;
+static void glow_tick(long long now, int scr) {
 	glow_k = pulse_k(now);
-	int y;
+	int want = glow_target(scr);
+	if (!glow_anim && want != glow_y) {
+		glow_from = glow_y;
+		glow_to = want;
+		glow_t0 = now;
+		glow_anim = 1;
+	}
+	if (!glow_anim) return;
 	long long e = now - glow_t0;
 	if (e >= GLOW_US) {
-		y = glow_to;
+		glow_y = glow_to;
 		glow_anim = 0;
 	} else {
 		long long d = (long long)glow_to - glow_from;
 		long long rem = GLOW_US - e;
-		y = glow_to - (int)(d * rem * rem * rem / GLOW_CUBE); /* Cubic ease-out */
+		glow_y = glow_to - (int)(d * rem * rem * rem / GLOW_CUBE); /* Cubic ease-out */
 	}
-	if (y == glow_y) return glow_anim ? -1 : 0;
-	int s0 = snap0_of(scr);
-	int lo = glow_y < y ? glow_y : y;
-	int hi = glow_y > y ? glow_y : y;
-	int r0 = lo < s0 ? s0 : lo;
-	int r1 = hi + SEL_H > SCREEN_H ? SCREEN_H : hi + SEL_H;
-	glow_redraw(scr, r0, r1, y);
-	glow_y = y;
-	return 1;
 }
 
 /* ---------------- Page turn: the old page flips outward around a vertical edge, narrowing in perspective ----------------
    When native enters level 2/3, the previous page is flipped away like a sheet of paper: the right edge (left edge when going back)
    translates all the way to the opposite side while the page is squashed near-large-far-small, flipping until invisible as the new page is revealed underneath.
-   Approach: save the whole old screen before switching pages, save again after the new page is drawn; each frame first restore the column range
-   covered last frame from the new page, then paste the old page back column by column with perspective. */
+   GPU approach: the outgoing page is painted once per frame into a render target, then sampled as vertical strips -- each strip a
+   textured quad whose height is scaled by the perspective factor. Two full page paints per turn frame, at 30fps for 420ms. */
 #define PEEL_US     420000LL
-#define PEEL_FRAME  33333LL    /* 30fps is enough; the saved time goes to per-column sampling */
+#define PEEL_STRIP  8          /* Destination columns sampled together; a strip is one quad */
 #define PEEL_Y0     LT_TOP     /* The top bar doesn't participate in the page turn */
 #define PEEL_CY     320        /* Perspective centerline; the page's top and bottom edges converge toward it */
 #define PEEL_TURN   1.15f      /* Max rotation angle (radians, about 66 degrees) */
 #define PEEL_DEPTH  2.6f       /* Strength of the near-large-far-small effect */
 
-static uint32_t *peel_src, *peel_new;
-static int peel_ready, peel_on, peel_dir, peel_x0, peel_x1;
-static long long peel_t0, peel_next;
+static vita2d_texture *T_peel;
+static int peel_on, peel_dir, peel_scr;
+static long long peel_t0;
 
-static void peel_alloc(void) {
-	size_t n = (size_t)SCREEN_H * RENDER_PITCH * 4;
-	peel_src = render_alloc(n);
-	peel_new = render_alloc(n);
-	peel_ready = peel_src && peel_new;
-	if (!peel_ready) dlog("peel alloc fail");
+static void peel_init(void) {
+	T_peel = gpu_tex_rt(SCREEN_W, SCREEN_H);
+	if (!T_peel) dlog("peel rt fail: page turn disabled"); /* degrade to a plain cut, never block the app */
 }
 
-/* Called before switching pages: save the old page still on screen */
-static void peel_begin(int dir, long long now) {
-	if (!peel_ready) return;
-	memcpy(peel_src, render_cur_fb(), (size_t)SCREEN_H * RENDER_PITCH * 4);
+/* Called when the screen changes: dir +1 forward, -1 back; scr is the page being left */
+static void peel_begin(int dir, int scr, long long now) {
+	if (!T_peel) return;
+	peel_scr = scr;
 	peel_dir = dir;
 	peel_t0 = now;
-	peel_next = now; /* Must draw this frame: the old page still fills the screen */
-	peel_x0 = 0;
-	peel_x1 = SCREEN_W; /* Frame 0: old page fills the screen, restore full-width first */
 	peel_on = 1;
 }
 
-/* Called after the new page is drawn: save it as the base during the page turn */
-static void peel_capture(void) {
-	memcpy(peel_new, render_cur_fb(), (size_t)SCREEN_H * RENDER_PITCH * 4);
-}
-
-/* Returns 1 = screen updated, -1 = next frame not due yet */
-static int peel_frame(long long now) {
-	if (now < peel_next) return -1;
-	peel_next = now + PEEL_FRAME;
-	uint32_t *fb = render_cur_fb();
+/* Drawn over the fresh new page: the flipping sheet as a row of narrowing strips */
+static void peel_strips(long long now) {
 	float t = (float)(now - peel_t0) / (float)PEEL_US;
-	if (t > 1.f) t = 1.f;
+	if (t >= 1.f) { peel_on = 0; return; }
 	float e = t * t * (3.f - 2.f * t); /* smoothstep: slow at both ends, fast in the middle */
-	if (peel_x1 > peel_x0) {
-		size_t nb = (size_t)(peel_x1 - peel_x0) * 4;
-		for (int y = PEEL_Y0; y < SCREEN_H; y++)
-			memcpy(fb + (size_t)y * RENDER_PITCH + peel_x0,
-			       peel_new + (size_t)y * RENDER_PITCH + peel_x0, nb);
-	}
-	peel_x0 = SCREEN_W;
-	peel_x1 = 0;
-	if (e >= 1.f) {
-		peel_on = 0;
-		render_mark_dirty(PEEL_Y0, SCREEN_H - PEEL_Y0);
-		return 1;
-	}
 	float cs = cosf(e * PEEL_TURN);
 	float D = PEEL_DEPTH * e;
 	int hinge = (int)(SCREEN_W * (1.f - e) + 0.5f); /* Hinge; moves right to left in mirrored space */
 	int shade = 255 - (int)(60.f * e);              /* Darken slightly while flipping away */
-	for (int xp = hinge; xp >= 0; xp--) {
-		float v = (float)(hinge - xp) / (960.f * cs); /* v = u/(1+D*u) */
+	for (int xa = hinge; xa >= 0; xa -= PEEL_STRIP) {
+		float v = (float)(hinge - xa) / (960.f * cs); /* v = u/(1+D*u) */
 		float den = 1.f - D * v;
 		if (den < 0.02f) break;
 		float u = v / den;
 		if (u > 1.f) break;                        /* Past the paper edge; nothing left on the left */
-		float S = 1.f / (1.f + D * u);             /* Vertical scale of this column */
-		int sc = (int)(u * 959.f + 0.5f);
-		int scol = peel_dir > 0 ? SCREEN_W - 1 - sc : sc;
-		int X = peel_dir > 0 ? xp : SCREEN_W - 1 - xp;
-		if (X < 0 || X >= SCREEN_W) continue;
+		float S = 1.f / (1.f + D * u);             /* Vertical scale of this strip */
+		int sw = xa + 1 < PEEL_STRIP ? xa + 1 : PEEL_STRIP;
+		int scol = (int)(u * 959.f + 0.5f);
+		int src = peel_dir > 0 ? SCREEN_W - 1 - (scol + sw - 1) : scol;
+		int destX = peel_dir > 0 ? xa - sw + 1 : SCREEN_W - 1 - xa;
+		/* Both edges shrink toward PEEL_CY, so a strip can never leave the page area: no clipping needed */
 		int y0 = PEEL_CY + (int)((PEEL_Y0 - PEEL_CY) * S);
-		int y1 = PEEL_CY + (int)((SCREEN_H - PEEL_CY) * S);
-		if (y0 < PEEL_Y0) y0 = PEEL_Y0;
-		if (y1 > SCREEN_H) y1 = SCREEN_H;
-		if (y1 <= y0) continue;
-		int s256 = (int)(256.f / S); /* Fixed point: destination row -> source row */
-		for (int y = y0; y < y1; y++) {
-			int sy = PEEL_CY + (((y - PEEL_CY) * s256) >> 8);
-			if (sy < PEEL_Y0) sy = PEEL_Y0;
-			else if (sy >= SCREEN_H) sy = SCREEN_H - 1;
-			uint32_t p = peel_src[(size_t)sy * RENDER_PITCH + scol];
-			uint32_t r = ((p & 0xff) * shade) >> 8;
-			uint32_t g = (((p >> 8) & 0xff) * shade) >> 8;
-			uint32_t b = (((p >> 16) & 0xff) * shade) >> 8;
-			fb[(size_t)y * RENDER_PITCH + X] = (p & 0xff000000) | (b << 16) | (g << 8) | r;
-		}
-		if (X < peel_x0) peel_x0 = X;
-		if (X + 1 > peel_x1) peel_x1 = X + 1;
+		gpu_draw_part_shade_scale(T_peel, destX, y0, src, PEEL_Y0, sw, SCREEN_H - PEEL_Y0, S, shade);
 	}
-	render_mark_dirty(PEEL_Y0, SCREEN_H - PEEL_Y0);
-	return 1;
 }
 
-/* ---------------- Info band (from level 2 on, the strip above the list) ----------------
-   No texture baking: it's drawn only once per screen/generation change, so drawing straight into the canvas is simpler and can't pick up stale data. */
+/* ---------------- Info band (from level 2 on, the strip above the list) ---------------- */
 static void draw_header(int scr) {
 	int y = LT_TOP;
-	uint32_t *fb = render_cur_fb();
-	for (int j = 0; j < ROW_H; j++)
-		memcpy(fb + (size_t)(y + j) * RENDER_PITCH, bg + (size_t)(y + j) * SCREEN_W,
-		       SCREEN_W * 4);
-	blend_into(fb, SCREEN_H, 0, y - 1, &S_rowbg);
+	gpu_draw(0, y - 1, T_rowbg);
 	char sub[80];
 	sub[0] = 0;
 	if (scr == SCR_GROUPS || scr == SCR_TROPHIES) {
@@ -1226,21 +856,20 @@ static void draw_header(int scr) {
 			snprintf(sub, sizeof(sub), "%d 个奖杯%s", g->tn, g->dlc ? " · DLC" : "");
 			draw_row_set(y, g->name, sub, 0, g->cnt, 0);
 		}
-		blit_icon(ICON_X, y + 3, IC_COVER, dt_head.icon);
+		draw_icon_at(ICON_X, y + 3, IC_COVER, dt_head.icon, 1);
 	} else {
 		const PsTrophy *t = &dt_trophy[trophy_sel()];
-		blit_cup(ICON_X + 32, y, t);
-		render_text_clip(TXT_X, y + 40, t->cn[0] ? t->cn : t->name, C(245, 245, 245), 24, TXT_W);
+		draw_icon_at(ICON_X + 32, y, IC_CUP, t->icon, 0);
+		gpu_text_clip(TXT_X, y + 40, t->cn[0] ? t->cn : t->name, C(245, 245, 245), 24, TXT_W);
 		if (scr == SCR_TIPVIEW && tips_ready() && curv[SCR_TIPS] < dt_tip_n) {
 			const PsTip *p = &dt_tip[curv[SCR_TIPS]];
 			char hb[176];
 			snprintf(hb, sizeof(hb), "%s · %s", p->author, p->date);
-			render_text_clip(TXT_X, y + 66, hb, C(150, 200, 255), 16, TXT_W);
+			gpu_text_clip(TXT_X, y + 66, hb, C(150, 200, 255), 16, TXT_W);
 		} else {
-			render_text_clip(TXT_X, y + 66, t->detail, C(150, 150, 150), 15, TXT_W);
+			gpu_text_clip(TXT_X, y + 66, t->detail, C(150, 150, 150), 15, TXT_W);
 		}
 	}
-	render_mark_dirty(y - 1, ROW_H + 1);
 }
 
 /* ---------------- Level 5: full-page body ----------------
@@ -1256,55 +885,42 @@ static void paint_tipview(void) {
 	/* Reserve the bottom strip for the back button so the last body line isn't covered by the key art */
 	int vis = (SCREEN_H - 52 - y0) / TV_LH;
 	if (vis < 1) vis = 1;
-	/* Lay the body area's background back first: scrolling uses the fast path that only redraws the list area, so the previous frame's text is still on the canvas,
-	   and overlaying directly would ghost (the full-screen redraw path has blit_bg; only here was it missed) */
-	uint32_t *fb = render_cur_fb();
-	for (int y = LT_TOP + ROW_H; y < SCREEN_H; y++)
-		memcpy(fb + (size_t)y * RENDER_PITCH, bg + (size_t)y * SCREEN_W, SCREEN_W * 4);
 	if (!tips_ready() || !dt_tip_n) {
-		if (data_busy()) render_text(TV_X, y0 + 20, "正在加载 Tips…", C(150, 150, 150), 20);
-		else render_text(TV_X, y0 + 20, "这条奖杯还没有 Tips", C(150, 150, 150), 20);
-		render_mark_dirty(LT_TOP + ROW_H, SCREEN_H - LT_TOP - ROW_H);
+		if (data_busy()) gpu_text(TV_X, y0 + 20, "正在加载 Tips…", C(150, 150, 150), 20);
+		else gpu_text(TV_X, y0 + 20, "这条奖杯还没有 Tips", C(150, 150, 150), 20);
 		return;
 	}
 	const PsTip *p = &dt_tip[curv[SCR_TIPS] < dt_tip_n ? curv[SCR_TIPS] : 0];
+	/* First pass only counts the laid-out lines (all advance lookups are cache hits), then the visible window is drawn */
 	int total = 0;
-	render_text_scroll(TV_X, y0, p->content, C(225, 225, 225), TV_PX, TV_W, 0, 0, &total);
+	gpu_text_scroll(TV_X, y0, p->content, C(225, 225, 225), TV_PX, TV_W, 0, 0, &total);
 	tv_total = total;
 	tv_top_max = total > vis ? total - vis : 0;
 	if (tip_top > tv_top_max) tip_top = tv_top_max;
 	if (tip_top < 0) tip_top = 0;
-	render_text_scroll(TV_X, y0, p->content, C(225, 225, 225), TV_PX, TV_W, vis, tip_top, NULL);
+	gpu_text_scroll(TV_X, y0, p->content, C(225, 225, 225), TV_PX, TV_W, vis, tip_top, NULL);
 	char b[40];
 	snprintf(b, sizeof(b), "%d / %d 行", tip_top + 1, total);
-	render_text(SCREEN_W - 210, SCREEN_H - 12, b, C(140, 140, 140), 14);
-	if (tip_top < tv_top_max) render_text(SCREEN_W - 90, SCREEN_H - 14, "下 ▾", C(140, 140, 140), 16);
-	draw_back_btn(SCR_TIPVIEW);
-	render_mark_dirty(LT_TOP + ROW_H, SCREEN_H - LT_TOP - ROW_H);
+	gpu_text(SCREEN_W - 210, SCREEN_H - 12, b, C(140, 140, 140), 14);
+	if (tip_top < tv_top_max) gpu_text(SCREEN_W - 90, SCREEN_H - 14, "下 ▾", C(140, 140, 140), 16);
 }
 
-/* ---------------- Full screen ---------------- */
+/* ---------------- Full screen ----------------
+   Drawing order is the compositing order. Chrome comes last on purpose: a row that slides past the
+   top of the list area is erased by repainting the background band under the top bar and info band,
+   so nothing depends on a scissor rectangle behaving as expected. */
 static void paint_screen(int scr) {
-	blit_bg();
-	draw_topbar();
-	draw_hint(scr);
-	spin_shown = -1; /* After a full-screen redraw the spinner must be redrawn too */
-	if (scr == SCR_GAMES) {
-		paint_list(scr);
-	} else {
-		draw_header(scr);
-		if (scr == SCR_TIPVIEW) paint_tipview();
-		else paint_list(scr);
-	}
-	/* The top bar and bottom hints differ per screen, but blit_bg/draw_topbar don't mark dirty themselves:
-	   without marking the full screen dirty once, the top bar would still show the previous screen's hint after a page turn */
-	render_mark_dirty(0, SCREEN_H);
-}
-
-/* Redraw only the list area (icon arrived, cursor scrolled, loading note changed) */
-static void repaint_list(int scr) {
+	gpu_draw(0, 0, T_bg);
 	if (scr == SCR_TIPVIEW) paint_tipview();
 	else paint_list(scr);
+	int lt = lt_of(scr);
+	bg_band(0, lt);
+	draw_topbar();
+	draw_hint(scr);
+	draw_spinner(spin_shown);
+	if (scr != SCR_GAMES) draw_header(scr);
+	draw_scrollbar(scr);
+	draw_back_btn(scr);
 }
 
 /* ---------------- System buttons: HK/CN consoles use ○ confirm × back; JP/US consoles are reversed ---------------- */
@@ -1417,7 +1033,7 @@ static void open_ime(void) {
 
 /* Returns 1 = the dialog has ended (text captured or exited on failure) */
 static int pump_ime(void) {
-	SceCommonDialogStatus st = sceImeDialogGetStatus();
+	int st = (int)sceImeDialogGetStatus(); /* the enum's underlying type is unsigned: keep the error bit visible */
 	if (st < 0) { /* Don't get stuck in the IME branch when Init succeeded but the dialog isn't running */
 		dlog("ime status=%x", (unsigned)st);
 		sceImeDialogTerm();
@@ -1456,25 +1072,22 @@ static void cancel_search(void) {
 }
 
 static long long spin_next;
-static int spin_f;
 
 static long long prof_sum, prof_max;
 static int prof_n;
 
-/* Top-right spinner: 8fps is enough; it marks its own rows dirty */
-static int spin_tick(long long now) {
-	if (now < spin_next) return 0;
+/* Top-right spinner: 8fps is enough; paint_screen just draws the current frame index */
+static void spin_tick(long long now) {
+	if (now < spin_next) return;
 	spin_next = now + 125000;
-	if (data_busy()) draw_spinner(spin_f = (spin_f + 1) & 7);
-	else if (spin_shown >= 0) draw_spinner(-1);
-	else return 0;
-	return 1;
+	if (data_busy()) spin_shown = (spin_shown + 1) & 7;
+	else spin_shown = -1;
 }
 
 /* ---------------- Touch ----------------
-   The list follows the finger row by row: every full row height the finger travels moves the cursor one slot, and reveal() drags the viewport along.
-   No pixel-level smooth scrolling — row-band textures and the clean snapshot are all ROW_H-aligned; a half-row offset
-   would require rewriting the whole compositing chain, not worth the gain.
+   The list tracks the finger one pixel at a time: dragging moves the pixel viewport (viewpx) directly and the
+   cursor follows the rounded viewport, so a half-row offset is normal and needs no special case now that the
+   GPU composites each row at its own position.
    Dragging past the bounds doesn't hard-stop: it feeds overscroll, rows split apart (native's pull-past-top separation animation),
    springing back 260ms after release.
    On lift, total displacement <12px and hold <300ms counts as a tap. */
@@ -1608,335 +1221,276 @@ static int touch_step(long long now, int scr, int *tap) {
 
 int main(void) {
 	diag_open();
-	if (render_init() < 0) sceKernelExitProcess(1);
+	/* vita2d must bring GXM up by itself: its sceGxmInitialize registers the display-queue callback
+	   that performs the actual sceDisplaySetFrameBuf flip. Initialising GXM first with our own params
+	   steals that hook and the screen stays black while the loop keeps running. */
+	if (gpu_init() < 0) sceKernelExitProcess(1);
 	sceCtrlSetSamplingMode(SCE_CTRL_MODE_DIGITAL);
-	/* The IME soft keyboard can only be tapped; the main UI doesn't consume touch, but front-panel sampling must stay on for the dialog */
+	/* The IME soft keyboard is touch-only and so is list dragging: the front panel must be sampled either way */
 	sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_START);
-	init_buttons();
+	init_buttons(); /* apputil: the common-dialog family needs the app registered before any dialog */
 	SceCommonDialogConfigParam cdp = {0};
 	sceCommonDialogSetConfigParam(&cdp);
-	int gx = render_dialog_init();
-	dlog("dialog gxm=%x", (unsigned)gx);
 	infobar_set(1);
 	if (load_sprites() < 0) sceKernelExitProcess(1);
 	bake_hl();
-	bake_buf = render_alloc0((size_t)ROW_H * RENDER_PITCH * 4);
 	bake_parts();
 	bake_spinner();
-	bake_bands();
-	peel_alloc();
+	peel_init();
 	if (data_init() < 0) dlog("data init fail");
 	want_screen(SCR_GAMES);
 	/* vitasdk's printf doesn't know %zu; writing %zu prints "zu" verbatim */
-	dlog("ready pool=%dMB used=%dMB ovf=%dKB", (int)(render_arena_total() >> 20),
-	     (int)(render_arena_used() >> 20), (int)(render_arena_overflow() >> 10));
+	dlog("ready pool=%dMB used=%dMB ovf=%dKB", (int)(gpu_arena_total() >> 20),
+	     (int)(gpu_arena_used() >> 20), (int)(gpu_arena_overflow() >> 10));
 
 	unsigned int prev = 0;
 	long long up_t = 0, down_t = 0;
 	int up_rep = 0, down_rep = 0;
-	int snap_scr = -1, snap_top = -1, snap_gen = -1;
-	int snap_tip = -1, snap_grp = -1;
-	int need = 0;     /* Redraw list only: icon arrived, loading state changed */
-	int first = 1;
-	/* Frame interval while the IME is up: should be ≈16.7ms after waiting for vsync; significantly larger means it can't keep up */
+	int snap_scr = -1;
+	int first = 1, pad_resync = 0;
+	/* Frame period while the IME is up: should stay near 16.7ms; well above that means the dialog is costing us frames */
 	long long ime_t = 0, ime_sum = 0;
 	int ime_n = 0;
-	/* Each round: collect background results -> read keys -> locate changes -> repaint only affected rows -> DMA to screen.
-	   Networking and parsing are all in data.c's thread; the worst slowdown here is baking one row. */
+
+	/* One iteration = one displayed frame: collect background results -> read input -> advance the
+	   animations -> repaint the whole screen -> vsync-paced swap. Nothing sleeps here any more,
+	   swap_buffers is what sets the tempo, and there is no dirty-row bookkeeping left to keep in sync. */
 	for (;;) {
-		/* IME running: don't redraw a single character of the base; just lay the canvas onto the next page and overlay the dialog */
-		if (ime_active) {
-			tr_down = 0; /* The lift was consumed by the soft keyboard; don't treat it as one of our taps when we come back */
-			int ended = pump_ime();
-			if (ime_active) {
-				/* Icons keep arriving, and paint_screen costs 120ms per frame — that's "lag + flicker".
-				   The keyboard covers the base, so here we only drain in-flight results; the screen gets a full redraw after the dialog closes.
-				   The full-page relayout can't be skipped: the dialog overlays a translucent base on that page every frame, and skipping it gets darker and darker */
-				(void)data_poll();
-				render_compose_begin();
-				SceCommonDialogUpdateParam up;
-				memset(&up, 0, sizeof(up));
-				up.renderTarget.depthSurfaceData = NULL;
-				up.renderTarget.colorSurfaceData = render_pending_page();
-				up.renderTarget.surfaceType = SCE_GXM_COLOR_SURFACE_LINEAR;
-				up.renderTarget.colorFormat = SCE_GXM_COLOR_FORMAT_A8B8G8R8;
-				up.renderTarget.width = SCREEN_W;
-				up.renderTarget.height = SCREEN_H;
-				up.renderTarget.strideInPixels = RENDER_PITCH;
-				up.displaySyncObject = render_pending_sync();
-				sceCommonDialogUpdate(&up);
-				render_compose_end(); /* Waits one vsync frame internally; no need to sleep here */
-				long long t1 = sceKernelGetProcessTimeWide();
-				if (ime_t) ime_sum += t1 - ime_t;
-				ime_t = t1;
-				if (++ime_n >= 120) {
-					dlog("ime n=%d avg=%dus", ime_n, (int)(ime_sum / ime_n));
-					ime_sum = 0;
-					ime_n = 0;
-				}
-			} else if (ended) {
-				ime_t = 0;
-				first = 1; /* The dialog is gone and scribbled over the base; redo the whole screen once */
-			}
-			continue;
-		}
-
-		SceCtrlData pad;
-		sceCtrlReadBufferPositive(0, &pad, 1);
-		unsigned int hit = pad.buttons & ~prev;
-		prev = pad.buttons;
-		long long now = sceKernelGetProcessTimeWide();
-
-		if (hit & SCE_CTRL_START) sceKernelExitProcess(0);
-
 		int dc = data_poll();
-		if (dc) need = 1;
 		if (dc & DC_GAME) {
-			/* Only one trophy group (no DLC) means no level 2 to view; drop straight to the trophy list */
+			/* Only one trophy group (no DLC) means there is no level 2 to look at: drop straight to the trophy list */
 			if (screen_id == SCR_GROUPS && dt_group_n <= 1) screen_id = SCR_TROPHIES;
 		}
-		if (dc & DC_LIST) list_want = dt_list_page; /* Continue fetching based on the page actually received */
+		if (dc & DC_LIST) list_want = dt_list_page; /* continue fetching from the page actually received */
 
+		long long now = sceKernelGetProcessTimeWide();
 		int scr = screen_id;
 		int *cp = cur_pp(scr), *tp2 = top_pp(scr);
 		int n = cnt_of(scr);
+		unsigned int hit = 0;
+		int tap = -1;
 
-		/* Touch: dragging tracks the finger pixel by pixel; on lift, hitting the search box/back button/a row is converted into the corresponding key,
-		   so the whole navigation logic below is reused as-is and touch feels identical to keys */
-		int tap;
-		if (touch_step(now, scr, &tap)) need = 1;
-		if (tap == -3) hit |= SCE_CTRL_TRIANGLE;
-		else if (tap == -2 && bub_t0 < 0) { bub_t0 = now; need = 1; } /* Touching the bubble: play the white mask first */
-		else if (tap >= 0 && !peel_on) {
-			*cp = tap;
-			reveal(cp, tp2, scr);
-			sl_anim = 0;
-			viewpx[scr] = top_of(scr) * ROW_H; /* Tapping a row settles immediately; the page-turn animation takes over */
-			hit |= ok_btn;
-		}
-		if (bub_t0 >= 0 && now - bub_t0 >= BUB_FLASH_US) {
-			bub_t0 = -1;
-			hit |= back_btn;   /* Only actually go back after the white mask finishes */
-		}
-
-		/* Native: only the d-pad lights the breathing teal mask; LEFT gives focus to the back bubble (teal mask),
-		   pressing confirm on the focus = go back, other d-pad directions cancel the focus */
-		if (!peel_on && scr != SCR_TIPVIEW) {
-			if (hit & SCE_CTRL_LEFT) {
-				if (scr != SCR_GAMES && !bk_focus) { bk_focus = 1; need = 1; }
-			} else if (hit & (SCE_CTRL_UP | SCE_CTRL_DOWN | SCE_CTRL_RIGHT)) {
-				if (bk_focus) { bk_focus = 0; need = 1; }
-			}
-			if (bk_focus && (hit & ok_btn)) {
-				hit &= ~ok_btn;
-				hit |= back_btn;
-				bk_focus = 0;
-				need = 1;
-			}
-			if (hit & (SCE_CTRL_UP | SCE_CTRL_DOWN)) { glow_on = 1; glow_last = now; }
-		}
-		int top_before = top_of(scr);
-
-		/* This page is still empty yet no request is in flight = the last request failed: resend every 3 seconds,
-		   otherwise the user is stuck forever on an empty list or "loading" (happens when WiFi isn't connected yet at startup) */
-		if (!peel_on && now >= retry_at) {
-			int posted = 0;
-			if (scr == SCR_GAMES && !list_ready() && !data_pending(DP_LIST)) {
-				list_want = 1;
-				data_request_list(1);
-				posted = 1;
-			} else if ((scr == SCR_GROUPS || scr == SCR_TROPHIES) && want_game &&
-			           !game_ready() && !data_pending(DP_GAME)) {
-				data_request_game(want_game);
-				posted = 1;
-			} else if ((scr == SCR_TIPS || scr == SCR_TIPVIEW) && want_trophy &&
-			           !tips_ready() && !data_pending(DP_TIPS)) {
-				data_request_tips(want_trophy);
-				posted = 1;
-			}
-			if (posted) {
-				retry_at = now + 3000000;
-				need = 1;
-			}
-		}
-
-		/* Timed auto-repeat: the first press steps once; only after holding 350ms does it accelerate to one step every 70ms */
-		if (scr == SCR_TIPVIEW) { /* Level 5 scrolls body lines */
-			if (!peel_on && (pad.buttons & SCE_CTRL_UP)) {
-				if (hit & SCE_CTRL_UP) { if (tip_top > 0) { tip_top--; need = 1; } up_t = now; up_rep = 0; }
-				else if (now - up_t >= (up_rep ? 25000 : 350000)) {
-					if (tip_top > 0) { tip_top--; need = 1; }
-					up_t = now;
-					up_rep = 1;
-				}
-			} else up_rep = 0;
-			if (!peel_on && (pad.buttons & SCE_CTRL_DOWN)) {
-				if (hit & SCE_CTRL_DOWN) { tip_top++; need = 1; down_t = now; down_rep = 0; }
-				else if (now - down_t >= (down_rep ? 25000 : 350000)) { tip_top++; need = 1; down_t = now; down_rep = 1; }
-			} else down_rep = 0;
+		/* The dialog owns the screen and the input while it is open, but the base page keeps being
+		   repainted underneath: the shell composites it against the keyboard every swap. */
+		if (ime_active) {
+			tr_down = 0; /* the lift happened on the soft keyboard, not on our list */
+			if (pump_ime()) pad_resync = 1;
 		} else {
-			if (!peel_on && (pad.buttons & SCE_CTRL_UP)) {
-				if (hit & SCE_CTRL_UP) { if (*cp > 0) (*cp)--; up_t = now; up_rep = 0; }
-				else if (now - up_t >= (up_rep ? 70000 : 350000)) {
-					if (*cp > 0) (*cp)--;
-					up_t = now;
-					up_rep = 1;
-				}
+			SceCtrlData pad;
+			sceCtrlReadBufferPositive(0, &pad, 1);
+			hit = pad.buttons & ~prev;
+			prev = pad.buttons;
+			if (pad_resync) { hit = 0; pad_resync = 0; } /* don't act on the key the dialog just consumed */
+
+			if (hit & SCE_CTRL_START) sceKernelExitProcess(0);
+
+			/* Touch: dragging tracks the finger pixel by pixel; on lift, hitting the search box / back bubble /
+			   a row turns into the matching key, so all the navigation below is reused as-is and touch feels like keys */
+			touch_step(now, scr, &tap);
+			if (tap == -3) hit |= SCE_CTRL_TRIANGLE;
+			else if (tap == -2 && bub_t0 < 0) bub_t0 = now; /* touching the bubble plays the white mask first */
+			else if (tap >= 0 && !peel_on) {
+				*cp = tap;
 				reveal(cp, tp2, scr);
-			} else up_rep = 0;
-			if (!peel_on && (pad.buttons & SCE_CTRL_DOWN)) {
-				if (hit & SCE_CTRL_DOWN) { if (*cp + 1 < n) (*cp)++; down_t = now; down_rep = 0; }
-				else if (now - down_t >= (down_rep ? 70000 : 350000)) {
-					if (*cp + 1 < n) (*cp)++;
-					down_t = now;
-					down_rep = 1;
-				}
-				reveal(cp, tp2, scr);
-			} else down_rep = 0;
-		}
-
-		/* Level-1 pulled to the bottom: auto-fetch the next page and append it (native list behavior, no more left/right paging) */
-		if (scr == SCR_GAMES && dt_list_more && !list_pending() && !peel_on &&
-		    curv[SCR_GAMES] + 1 >= dt_list_n) {
-			list_want = dt_list_page + 1;
-			data_request_list(list_want);
-			need = 1; /* Scrollbar and top-right spinner reflect the in-flight state immediately */
-		}
-
-		/* △ brings up the IME search, □ cancels the search back to the latest list: pressable at any level */
-		if (!peel_on && (hit & SCE_CTRL_TRIANGLE)) open_ime();
-		if (!peel_on && (hit & SCE_CTRL_SQUARE)) cancel_search();
-
-		if (!peel_on && (hit & (ok_btn | back_btn))) {
-			int old = scr;
-			if (hit & ok_btn) {
-				if (n <= 0) want_screen(scr); /* The note above reported a failure; ○ retries */
-				else if (scr == SCR_GAMES) {
-					want_game = dt_list[curv[SCR_GAMES]].game_id;
-					curv[SCR_GROUPS] = topv[SCR_GROUPS] = 0;
-					/* If we already know this game has no DLC, go straight to level 3 and skip an empty level */
-					screen_id = game_ready() && dt_group_n <= 1 ? SCR_TROPHIES : SCR_GROUPS;
-				} else if (scr == SCR_GROUPS) {
-					curv[SCR_TROPHIES] = topv[SCR_TROPHIES] = 0;
-					screen_id = SCR_TROPHIES;
-				} else if (scr == SCR_TROPHIES) {
-					want_trophy = dt_trophy[trophy_sel()].trophy_id;
-					curv[SCR_TIPS] = topv[SCR_TIPS] = 0;
-					screen_id = SCR_TIPS;
-				} else if (scr == SCR_TIPS) {
-					tip_top = 0;
-					screen_id = SCR_TIPVIEW;
-				}
-			} else if (scr == SCR_TIPVIEW) screen_id = SCR_TIPS;
-			else if (scr == SCR_TIPS) screen_id = SCR_TROPHIES;
-			else if (scr == SCR_TROPHIES)
-				screen_id = game_ready() && dt_group_n <= 1 ? SCR_GAMES : SCR_GROUPS;
-			else if (scr == SCR_GROUPS) screen_id = SCR_GAMES;
-			if (screen_id != old) {
-				peel_req = screen_id > old ? 1 : -1;
-				want_screen(screen_id);
+				sl_anim = 0;
+				viewpx[scr] = top_of(scr) * ROW_H; /* tapping a row settles at once; the page turn takes over */
+				hit |= ok_btn;
 			}
-		}
+			if (bub_t0 >= 0 && now - bub_t0 >= BUB_FLASH_US) {
+				bub_t0 = -1;
+				hit |= back_btn; /* only really go back after the white mask has finished */
+			}
 
-		/* D-pad/search-cancel changed the viewport: slide over; touch drag manages viewpx itself, don't interfere with the animation */
-		int nt2 = top_of(scr);
-		if (nt2 != top_before && !tr_down && tap < 0) view_slide_to(scr, nt2 * ROW_H, now);
+			/* Native: only the d-pad lights the breathing teal mask; LEFT hands focus to the back bubble (teal mask),
+			   confirming on that focus goes back, the other d-pad directions drop the focus */
+			if (!peel_on && scr != SCR_TIPVIEW) {
+				if (hit & SCE_CTRL_LEFT) {
+					if (scr != SCR_GAMES && !bk_focus) bk_focus = 1;
+				} else if (hit & (SCE_CTRL_UP | SCE_CTRL_DOWN | SCE_CTRL_RIGHT)) {
+					bk_focus = 0;
+				}
+				if (bk_focus && (hit & ok_btn)) {
+					hit &= ~ok_btn;
+					hit |= back_btn;
+					bk_focus = 0;
+				}
+				if (hit & (SCE_CTRL_UP | SCE_CTRL_DOWN)) {
+					if (!glow_on) glow_snap(glow_target(scr)); /* light up on its own row, never slide in from a stale one */
+					glow_on = 1;
+					glow_last = now;
+				}
+			}
+			int top_before = top_of(scr);
+
+			/* This page is still empty and no request is in flight = the last one failed: resend every 3 seconds,
+			   otherwise the user is stuck forever on an empty list or "loading" (happens when WiFi comes up after start) */
+			if (!peel_on && now >= retry_at) {
+				int posted = 0;
+				if (scr == SCR_GAMES && !list_ready() && !data_pending(DP_LIST)) {
+					list_want = 1;
+					data_request_list(1);
+					posted = 1;
+				} else if ((scr == SCR_GROUPS || scr == SCR_TROPHIES) && want_game &&
+				           !game_ready() && !data_pending(DP_GAME)) {
+					data_request_game(want_game);
+					posted = 1;
+				} else if ((scr == SCR_TIPS || scr == SCR_TIPVIEW) && want_trophy &&
+				           !tips_ready() && !data_pending(DP_TIPS)) {
+					data_request_tips(want_trophy);
+					posted = 1;
+				}
+				if (posted) retry_at = now + 3000000;
+			}
+
+			/* Timed auto-repeat: the first press steps once; only after 350ms of holding does it speed up to one step every 70ms */
+			if (scr == SCR_TIPVIEW) { /* level 5 scrolls body lines */
+				if (!peel_on && (pad.buttons & SCE_CTRL_UP)) {
+					if (hit & SCE_CTRL_UP) { if (tip_top > 0) tip_top--; up_t = now; up_rep = 0; }
+					else if (now - up_t >= (up_rep ? 25000 : 350000)) {
+						if (tip_top > 0) tip_top--;
+						up_t = now;
+						up_rep = 1;
+					}
+				} else up_rep = 0;
+				if (!peel_on && (pad.buttons & SCE_CTRL_DOWN)) {
+					if (hit & SCE_CTRL_DOWN) { tip_top++; down_t = now; down_rep = 0; }
+					else if (now - down_t >= (down_rep ? 25000 : 350000)) { tip_top++; down_t = now; down_rep = 1; }
+				} else down_rep = 0;
+			} else {
+				if (!peel_on && (pad.buttons & SCE_CTRL_UP)) {
+					if (hit & SCE_CTRL_UP) { if (*cp > 0) (*cp)--; up_t = now; up_rep = 0; }
+					else if (now - up_t >= (up_rep ? 70000 : 350000)) {
+						if (*cp > 0) (*cp)--;
+						up_t = now;
+						up_rep = 1;
+					}
+					reveal(cp, tp2, scr);
+				} else up_rep = 0;
+				if (!peel_on && (pad.buttons & SCE_CTRL_DOWN)) {
+					if (hit & SCE_CTRL_DOWN) { if (*cp + 1 < n) (*cp)++; down_t = now; down_rep = 0; }
+					else if (now - down_t >= (down_rep ? 70000 : 350000)) {
+						if (*cp + 1 < n) (*cp)++;
+						down_t = now;
+						down_rep = 1;
+					}
+					reveal(cp, tp2, scr);
+				} else down_rep = 0;
+			}
+
+			/* Level 1 pulled to the bottom: fetch the next page and append it (native list behaviour, no left/right paging) */
+			if (scr == SCR_GAMES && dt_list_more && !list_pending() && !peel_on && list_at_end()) {
+				list_want = dt_list_page + 1;
+				data_request_list(list_want);
+			}
+
+			/* △ opens the IME search, □ cancels it back to the latest list: pressable on every level */
+			if (!peel_on && (hit & SCE_CTRL_TRIANGLE)) open_ime();
+			if (!peel_on && (hit & SCE_CTRL_SQUARE)) cancel_search();
+
+			if (!peel_on && (hit & (ok_btn | back_btn))) {
+				int old = scr;
+				if (hit & ok_btn) {
+					if (n <= 0) want_screen(scr); /* the empty-page note reports a failure; ○ retries */
+					else if (scr == SCR_GAMES) {
+						want_game = dt_list[curv[SCR_GAMES]].game_id;
+						curv[SCR_GROUPS] = topv[SCR_GROUPS] = 0;
+						/* If we already know this game has no DLC, skip the empty level and go to level 3 */
+						screen_id = game_ready() && dt_group_n <= 1 ? SCR_TROPHIES : SCR_GROUPS;
+					} else if (scr == SCR_GROUPS) {
+						curv[SCR_TROPHIES] = topv[SCR_TROPHIES] = 0;
+						screen_id = SCR_TROPHIES;
+					} else if (scr == SCR_TROPHIES) {
+						want_trophy = dt_trophy[trophy_sel()].trophy_id;
+						curv[SCR_TIPS] = topv[SCR_TIPS] = 0;
+						screen_id = SCR_TIPS;
+					} else if (scr == SCR_TIPS) {
+						tip_top = 0;
+						screen_id = SCR_TIPVIEW;
+					}
+				} else if (scr == SCR_TIPVIEW) screen_id = SCR_TIPS;
+				else if (scr == SCR_TIPS) screen_id = SCR_TROPHIES;
+				else if (scr == SCR_TROPHIES)
+					screen_id = game_ready() && dt_group_n <= 1 ? SCR_GAMES : SCR_GROUPS;
+				else if (scr == SCR_GROUPS) screen_id = SCR_GAMES;
+				if (screen_id != old) {
+					peel_req = screen_id > old ? 1 : -1;
+					want_screen(screen_id);
+				}
+			}
+
+			/* D-pad / search-cancel moved the viewport: slide it over. Touch drag owns viewpx itself, don't fight it. */
+			int nt2 = top_of(scr);
+			if (nt2 != top_before && !tr_down && tap < 0) view_slide_to(scr, nt2 * ROW_H, now);
+		}
 
 		scr = screen_id;
-		long long t_draw = sceKernelGetProcessTimeWide();
-		if (ov_tick(now)) need = 1; /* The spring-back animation needs the list redrawn every frame */
-		if (view_tick(now, scr)) need = 1;
-		if (flash_idx >= 0) {       /* Touch white-flash fade-out */
+
+		ov_tick(now);              /* the overscroll gap springs back */
+		view_tick(now, scr);       /* settle / fling slides */
+		if (flash_idx >= 0) {      /* touch white-flash fade-out */
 			long long ft = now - flash_t0;
 			if (ft >= FLASH_US) flash_idx = -1;
-			else {
-				flash_k = 255 - (int)(ft * 255 / FLASH_US);
-				need = 1;
-			}
+			else flash_k = 255 - (int)(ft * 255 / FLASH_US);
 		}
-		if (bub_t0 >= 0) need = 1;  /* Bubble white-mask animation redraws every frame */
-		if (glow_on && now - glow_last > GLOW_HOLD) { glow_on = 0; need = 1; }
-		int top = top_of(scr);
-		int want = glow_target(scr);
-		int act = 0;
+		if (glow_on && now - glow_last > GLOW_HOLD) glow_on = 0;
+		if (glow_on) glow_tick(now, scr); /* slide to the next row, then keep breathing */
+		spin_tick(now);
 
-		if (first || scr != snap_scr) {
+		if (first || scr != snap_scr) { /* page entry: a fresh viewport, nothing carried over from the page before */
 			ov_e = ov_tgt = 0;
-			ov_anim = 0; /* Zero the split amount when switching pages; don't carry the previous page's gap over */
-			glow_on = 0; /* Native shows no mask when entering a page; the d-pad lights it on press */
+			ov_anim = 0;   /* zero the split when switching pages */
+			glow_on = 0;   /* native shows no mask on entry; the d-pad lights it on press */
 			bk_focus = 0;
 			bub_t0 = -1;
 			flash_idx = -1;
 			sl_anim = 0;
 			viewpx[scr] = top_of(scr) * ROW_H;
-			if (!first && peel_req > 0) peel_begin(1, now);
-			else if (!first && peel_req < 0) peel_begin(-1, now);
+			if (!first && peel_req) peel_begin(peel_req > 0 ? 1 : -1, snap_scr, now);
 			peel_req = 0;
-			need = 0;
-			paint_screen(scr);
-			if (scr != SCR_TIPVIEW && glow_on) glow_snap(want, scr);
 			snap_scr = scr;
-			snap_top = top;
-			snap_gen = gen_of(scr);
-			snap_grp = curv[SCR_GROUPS];
-			snap_tip = curv[SCR_TIPS];
 			first = 0;
-			if (peel_on) { peel_capture(); peel_frame(now); } /* Frame 0: old page fills the screen */
-			act = 1;
-		} else if (peel_on) {
-			act = peel_frame(now);
-		} else if (need || gen_of(scr) != snap_gen || curv[SCR_GROUPS] != snap_grp ||
-		           curv[SCR_TIPS] != snap_tip) {
-			/* Data generation changed (full-screen redraw, info band follows) or an icon arrived (patch only those list rows) */
-			need = 0;
-			int gen_changed = gen_of(scr) != snap_gen || curv[SCR_GROUPS] != snap_grp ||
-			                  curv[SCR_TIPS] != snap_tip;
-			if (gen_changed) paint_screen(scr);
-			else repaint_list(scr);
-			if (scr != SCR_TIPVIEW && glow_on) glow_snap(want, scr);
-			snap_gen = gen_of(scr);
-			snap_grp = curv[SCR_GROUPS];
-			snap_tip = curv[SCR_TIPS];
-			snap_top = top;
-			act = 1;
-		} else if (top != snap_top) {   /* Scrolling: redraw only the list; the top bar and info band stay put */
-			paint_list(scr);
-			if (glow_on) glow_snap(want, scr);
-			snap_top = top;
-			act = 1;
-		} else if (scr == SCR_TIPVIEW) {
-			act = 0; /* The reading page has no selection mask */
-		} else if (glow_on && (glow_anim || want != glow_y)) {
-			if (!glow_anim) glow_start(want, now);
-			act = glow_step(now, scr);
-		} else if (glow_on) {
-			act = pulse_tick(now, scr);   /* Even when idle, let the mask breathe */
-		} else {
-			act = 0;
 		}
 
-		if (spin_tick(now) && act <= 0) act = 1;
-
-		if (act <= 0) {
-			long long w = (peel_on ? peel_next : glow_next) - now;
-			if (data_busy() && spin_next - now < w) w = spin_next - now;
-			if (w < 2000) w = 2000;
-			sceKernelDelayThread((unsigned)w);
-			continue;
+		/* The page being flipped away is repainted once per turn frame into the render target,
+		   then sampled as vertical strips drawn over the new page. */
+		long long t_draw = sceKernelGetProcessTimeWide();
+		if (peel_on) {
+			gpu_rt_begin(T_peel);
+			paint_screen(peel_scr);
+			gpu_rt_end();
 		}
-		render_flip_now();
-
-		/* Quantifying the feel: report draw + page-turn cost every 60 displayed frames */
+		gpu_frame_begin();
+		paint_screen(scr);
+		if (peel_on) peel_strips(now);
+		/* Measured before the swap so the vsync wait doesn't pollute the number */
 		long long cost = sceKernelGetProcessTimeWide() - t_draw;
+		gpu_frame_end(); /* end_drawing -> common_dialog_update -> swap_buffers, in that order */
+
+		if (ime_active) {
+			long long t1 = sceKernelGetProcessTimeWide();
+			if (ime_t) ime_sum += t1 - ime_t;
+			ime_t = t1;
+			if (++ime_n >= 120) {
+				dlog("ime n=%d avg=%dus", ime_n, (int)(ime_sum / ime_n));
+				ime_sum = 0;
+				ime_n = 0;
+			}
+		} else {
+			ime_t = 0;
+			ime_n = 0;
+		}
+
+		/* Quantifying the feel: report the paint cost every 60 displayed frames */
 		if (cost > prof_max) prof_max = cost;
 		prof_sum += cost;
 		if (++prof_n >= 60) {
 			dlog("draw n=%d avg=%dus max=%dus used=%dMB ovf=%dKB", prof_n,
-			     (int)(prof_sum / prof_n), (int)prof_max, (int)(render_arena_used() >> 20),
-			     (int)(render_arena_overflow() >> 10));
+			     (int)(prof_sum / prof_n), (int)prof_max, (int)(gpu_arena_used() >> 20),
+			     (int)(gpu_arena_overflow() >> 10));
 			prof_sum = 0; prof_n = 0; prof_max = 0;
 		}
-		/* Touch-chain on-device diagnostics: when sliding misbehaves, these three numbers tell whether it's not received, not scrolling, or not tapping */
+		/* Touch-chain on-device diagnostics: when a slide misbehaves these three numbers say whether the
+		   touch was never received, scrolled nothing, or never landed a tap */
 		if (tg_n || tg_step || tg_tap) {
 			dlog("touch down=%d step=%d tap=%d", tg_n, tg_step, tg_tap);
 			tg_n = tg_step = tg_tap = 0;
