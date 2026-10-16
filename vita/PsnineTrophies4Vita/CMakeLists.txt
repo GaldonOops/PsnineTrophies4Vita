@@ -54,6 +54,7 @@ target_link_libraries(${PROJECT_NAME}
   SceNet_stub
   SceNetCtl_stub
   SceHttp_stub
+  SceSsl_stub
   SceTouch_stub
   SceCommonDialog_stub
 )
@@ -77,5 +78,6 @@ vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_TITLEID} eboot.bin
   FILE sce_sys/livearea/contents/bg.png sce_sys/livearea/contents/bg.png
   FILE sce_sys/livearea/contents/startup.png sce_sys/livearea/contents/startup.png
   FILE assets/font.ttf font.ttf
+  FILE certs/usertrust_rsa.pem certs/usertrust_rsa.pem
   ${ASSET_FILES}
 )

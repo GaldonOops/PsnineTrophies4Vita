@@ -2,6 +2,7 @@
 // Doubles as a patrol script: `npm run patrol` asserts the live DOM still parses
 // with the current selectors.
 import * as cheerio from "cheerio";
+import { connect } from "node:tls";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -133,12 +134,61 @@ function tipCensus(html) {
   return { post, list };
 }
 
+/* The app validates psnine against one bundled anchor (vita/.../certs/usertrust_rsa.pem), because the Vita's
+   own root store predates this chain and libhttp never refreshes anything. So the interesting drift is not
+   "is the site https" but "does its chain still end at the root we shipped" -- a CA swap breaks every device
+   build with nothing but an SSL error on screen. Plain http used to be the requirement; the site 302s it now. */
+const ANCHOR_CN = "USERTrust RSA Certification Authority";
+
+function chainRoot(host) {
+  return new Promise((resolve, reject) => {
+    const s = connect({ host, port: 443, servername: host, rejectUnauthorized: false });
+    s.on("secureConnect", () => {
+      let c = s.getPeerCertificate(true);
+      let last = "";
+      for (let i = 0; c && i < 8; i++) {
+        if (c.issuer?.CN) last = c.issuer.CN;
+        if (c.issuerCertificate === c) break;
+        c = c.issuerCertificate;
+      }
+      s.destroy();
+      resolve(last);
+    });
+    s.on("error", reject);
+  });
+}
+
+async function transportCanary() {
+  const url = "https://www.psnine.com/psngame?page=1";
+  let status = 0, html = "", root = "", err = "";
+  try {
+    const res = await fetch(url, {
+      headers: { "User-Agent": UA, "Accept-Language": "zh-CN,zh;q=0.9" },
+      redirect: "manual",
+    });
+    status = res.status;
+    html = status === 200 ? await res.text() : "";
+    root = await chainRoot("www.psnine.com");
+  } catch (e) {
+    err = e.message;
+  }
+  const served = status === 200 && /<td class="[^"]*\btitle\b/.test(html);
+  const anchored = root.includes(ANCHOR_CN);
+  return {
+    ok: served && anchored,
+    detail: err || `status=${status} bytes=${html.length} root=${root || "?"}${anchored ? "" : " != bundled anchor"}`,
+  };
+}
+
 export async function patrol() {
   const fails = [];
   const note = (good, label, detail = "") => {
     console.log(`${good ? "PASS" : "FAIL"}  ${label}${detail ? `  (${detail})` : ""}`);
     if (!good) fails.push(label);
   };
+
+  const tc = await transportCanary();
+  note(tc.ok, "https html served + chain ends at the bundled anchor", tc.detail);
 
   try {
     const r = await searchGames(PATROL_QUERY);

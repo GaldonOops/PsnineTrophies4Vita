@@ -6,7 +6,8 @@
 // Icon formats measured (2026-10-11, captured directly on Mac):
 //   psnobj.prod.dl.playstation.net covers return JPEG only, regardless of the Accept header;
 //   image.api.playstation.com trophy images default to AVIF; must append ?format=png to get PNG.
-// Plain HTTP returns 200 on both CDNs, so for now https is rewritten to http (TLS: see task #9).
+// Plain HTTP still answers 200 on both CDNs, so icon urls keep their https -> http rewrite;
+// psnine itself has moved to https only (it 302s plain http), and pages follow it there.
 #include "data.h"
 #include "net.h"
 #include "gpu.h"
@@ -128,7 +129,7 @@ static void post(int kind, long id, const char *url) {
 
 void data_request_list(int page) {
 	char url[128];
-	snprintf(url, sizeof(url), "http://psnine.com/psngame?page=%d", page < 1 ? 1 : page);
+	snprintf(url, sizeof(url), "https://www.psnine.com/psngame?page=%d", page < 1 ? 1 : page);
 	post(J_LIST, page, url);
 }
 
@@ -136,19 +137,19 @@ void data_request_list(int page) {
 void data_request_search(const char *kw) {
 	char enc[200], url[240];
 	net_url_encode(kw, enc, sizeof(enc));
-	snprintf(url, sizeof(url), "http://psnine.com/psngame?title=%s", enc);
+	snprintf(url, sizeof(url), "https://www.psnine.com/psngame?title=%s", enc);
 	post(J_LIST, 0, url);
 }
 
 void data_request_game(long game_id) {
 	char url[128];
-	snprintf(url, sizeof(url), "http://psnine.com/psngame/%ld", game_id);
+	snprintf(url, sizeof(url), "https://www.psnine.com/psngame/%ld", game_id);
 	post(J_GAME, game_id, url);
 }
 
 void data_request_tips(long trophy_id) {
 	char url[128];
-	snprintf(url, sizeof(url), "http://psnine.com/trophy/%ld", trophy_id);
+	snprintf(url, sizeof(url), "https://www.psnine.com/trophy/%ld", trophy_id);
 	post(J_TIPS, trophy_id, url);
 }
 
